@@ -18,20 +18,41 @@ DEFAULT_LEVEL = {ZSTD: 19, LZMA: 9}
 LEVEL_RANGE = {ZSTD: (1, 22), LZMA: (0, 9)}
 
 
-def _zstd_params(level: int):
+# zstd's match window: how far back it can find repeated data. The level's own
+# window (8 MiB at level 19) is grown to fit the data, up to AUTO_WINDOW_LOG;
+# "long range" mode allows up to LONG_WINDOW_LOG to catch repeats far apart in
+# very big inputs (backups, disk images). Unlocking needs about this much memory.
+AUTO_WINDOW_LOG = 27   # 128 MiB
+LONG_WINDOW_LOG = 30   # 1 GiB
+MAX_WINDOW_LOG = 31    # what the reader accepts
+
+
+def window_log(level: int, size_hint: int | None, long_range: bool = False) -> int:
+    base = zstd.ZstdCompressionParameters.from_level(level).window_log
+    if not size_hint or size_hint <= (1 << base):
+        return base
+    cap = LONG_WINDOW_LOG if long_range else AUTO_WINDOW_LOG
+    return max(base, min(cap, (size_hint - 1).bit_length()))
+
+
+def _zstd_params(level: int, size_hint: int | None = None, long_range: bool = False):
     # A 16 MiB job size lets the high levels use every CPU core with no loss in ratio.
+    # Long-distance matching finds repeats across the whole window, even with threads.
     return zstd.ZstdCompressionParameters.from_level(
-        level, enable_ldm=level >= 15, threads=-1, job_size=16 << 20, write_checksum=0)
+        level, window_log=window_log(level, size_hint, long_range),
+        enable_ldm=level >= 15 or long_range, threads=-1, job_size=16 << 20, write_checksum=0)
 
 
 class CompressWriter:
-    def __init__(self, target, algo: int, level: int | None = None):
+    def __init__(self, target, algo: int, level: int | None = None, size_hint: int | None = None,
+                 long_range: bool = False):
         self._t = target
         self.algo = algo
         if level is None:
             level = DEFAULT_LEVEL.get(algo, 0)
         if algo == ZSTD:
-            self._obj = zstd.ZstdCompressor(compression_params=_zstd_params(level)).compressobj()
+            params = _zstd_params(level, size_hint, long_range)
+            self._obj = zstd.ZstdCompressor(compression_params=params).compressobj()
         elif algo == LZMA:
             self._obj = lzma.LZMACompressor(format=lzma.FORMAT_XZ, check=lzma.CHECK_NONE,
                                             preset=level | lzma.PRESET_EXTREME)
@@ -88,7 +109,7 @@ class DecompressReader:
             raise CorruptFileError("unknown compression method")
         self.algo = head[0]
         if self.algo == ZSTD:
-            self._r = zstd.ZstdDecompressor(max_window_size=2**31).stream_reader(
+            self._r = zstd.ZstdDecompressor(max_window_size=1 << MAX_WINDOW_LOG).stream_reader(
                 source, read_across_frames=False, closefd=False)
         elif self.algo == LZMA:
             self._d = lzma.LZMADecompressor(format=lzma.FORMAT_XZ)

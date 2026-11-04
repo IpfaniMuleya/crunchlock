@@ -4,13 +4,21 @@ Each chunk's plaintext is ``u32 data_len | data | zero padding``. The nonce is
 ``nonce_prefix(7) | counter u32 | last_flag u8`` so chunks cannot be reordered,
 dropped, duplicated or truncated without detection. The full header is the
 associated data for every chunk.
+
+In signed files (header flag FLAG_SIGNED) the last chunk's plaintext ends with
+``Ed25519 public key (32) | signature (64)``. The signature covers a SHA-512
+hash of the plaintext data stream (not the keys), so it stays valid when the
+password or recipients are changed, and proves who made the contents. It is
+encrypted, so outsiders can't see who signed.
 """
 from __future__ import annotations
 
+import hashlib
 import struct
 from typing import BinaryIO, Callable
 
-from cryptography.exceptions import InvalidTag
+from cryptography.exceptions import InvalidSignature, InvalidTag
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .errors import CorruptFileError
@@ -18,6 +26,12 @@ from .errors import CorruptFileError
 TAG_LEN = 16
 _LEN = struct.Struct(">I")
 MAX_CHUNKS = 2**32 - 1
+SIG_LEN = 32 + 64
+_SIG_CONTEXT = b"crunchlock signature v1\x00"
+
+
+def _signed_message(digest: bytes) -> bytes:
+    return _SIG_CONTEXT + digest
 
 
 def padme(length: int) -> int:
@@ -41,13 +55,15 @@ class EncryptWriter:
     """Push-style writer: ``write()`` plaintext, ``close()`` to finalize."""
 
     def __init__(self, target, header_bytes: bytes, file_key: bytes, chunk_size: int,
-                 nonce_prefix: bytes, pad: bool = False):
+                 nonce_prefix: bytes, pad: bool = False, signer: Ed25519PrivateKey | None = None):
         self._t = target
         self._aad = header_bytes
         self._aead = AESGCM(file_key)
         self._cs = chunk_size
         self._prefix = nonce_prefix
-        self._pad = pad
+        self.pad = pad
+        self._signer = signer
+        self._hash = hashlib.sha512() if signer else None
         self._buf = bytearray()
         self._counter = 0
         self.data_bytes = 0
@@ -62,6 +78,8 @@ class EncryptWriter:
     def write(self, data) -> int:
         self._buf += data
         self.data_bytes += len(data)
+        if self._hash:
+            self._hash.update(data)
         cs = self._cs
         # Keep at least one byte buffered so the final chunk is known at close().
         while len(self._buf) > cs:
@@ -77,16 +95,25 @@ class EncryptWriter:
             return
         self._closed = True
         cs = self._cs
-        rem = bytes(self._buf)
+        data = bytes(self._buf)
         self._buf.clear()
-        extra = padme(self.data_bytes) - self.data_bytes if self._pad else 0
-        fill = min(extra, cs - len(rem))
-        extra -= fill
-        self._emit(_LEN.pack(len(rem)) + rem + bytes(fill), last=extra == 0)
-        while extra > 0:
-            z = min(extra, cs)
-            extra -= z
-            self._emit(_LEN.pack(0) + bytes(z), last=extra == 0)
+        zeros = padme(self.data_bytes) - self.data_bytes if self.pad else 0
+        trailer = b""
+        if self._signer is not None:
+            trailer = (self._signer.public_key().public_bytes_raw()
+                       + self._signer.sign(_signed_message(self._hash.digest())))
+        # Every chunk but the last must be full-size; the trailer ends the last one.
+        while True:
+            room = cs - len(data)
+            z = min(zeros, room)
+            zeros -= z
+            if zeros == 0 and room - z >= len(trailer):
+                self._emit(_LEN.pack(len(data)) + data + bytes(z) + trailer, last=True)
+                break
+            if zeros == 0:
+                z = room  # no room left for the signature: finish this chunk with zeros
+            self._emit(_LEN.pack(len(data)) + data + bytes(z), last=False)
+            data = b""
         if hasattr(self._t, "close"):
             self._t.close()
 
@@ -96,7 +123,11 @@ class DecryptReader:
 
     def __init__(self, source: BinaryIO, header_bytes: bytes, file_key: bytes,
                  chunk_size: int, nonce_prefix: bytes,
-                 progress: Callable[[int], None] | None = None):
+                 progress: Callable[[int], None] | None = None, signed: bool = False):
+        self._signed = signed
+        self._hash = hashlib.sha512() if signed else None
+        self.signer: bytes | None = None  # Ed25519 public key, once the signature checked out
+        self.padding_bytes = 0
         self._s = source
         self._aad = header_bytes
         self._aead = AESGCM(file_key)
@@ -143,15 +174,30 @@ class DecryptReader:
                                    f"(chunk {self._counter} failed authentication)") from None
         self._counter += 1
         (n,) = _LEN.unpack_from(pt)
-        if n > len(pt) - 4 or (self._data_ended and n):
-            raise CorruptFileError("malformed chunk")
+        body = len(pt) - (SIG_LEN if self._signed and last else 0)
+        if body < 4 or n > body - 4 or (self._data_ended and n):
+            raise CorruptFileError("the file's signature is missing" if body < 4 else "malformed chunk")
         if n < self._cs:
             self._data_ended = True
+        if self._hash:
+            self._hash.update(memoryview(pt)[4:4 + n])
+        self.padding_bytes += body - 4 - n
+        if self._signed and last:
+            self._check_signature(pt[body:])
         if self._progress:
             self._progress(self.bytes_in)
         if last:
             self._done = True
         return pt, last
+
+    def _check_signature(self, trailer: bytes) -> None:
+        pub, sig = trailer[:32], trailer[32:]
+        try:
+            Ed25519PublicKey.from_public_bytes(pub).verify(sig, _signed_message(self._hash.digest()))
+        except (InvalidSignature, ValueError):
+            raise CorruptFileError("the signature does not match the contents: the file was "
+                                   "changed after it was signed, or the signature is forged") from None
+        self.signer = pub
 
     def _next_chunk(self) -> None:
         pt, _ = self._decrypt_next()

@@ -6,11 +6,12 @@ import os
 import shutil
 import tarfile
 import tempfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
-from . import jpeg
+from . import jpeg, png
 from .errors import CorruptFileError, CrunchlockError
 
 if not hasattr(tarfile, "data_filter"):  # Python < 3.10.12 / 3.11.4
@@ -74,20 +75,26 @@ class PackStats:
         self.warnings: list[str] = []
         self.jpeg_files = 0
         self.jpeg_saved = 0
+        self.png_files = 0
 
 
-class _JpegPrefetcher:
-    """Transcodes upcoming JPEGs on worker threads, a bounded window ahead."""
+class _ImagePrefetcher:
+    """Transcodes upcoming JPEGs / PNGs on worker threads, a bounded window ahead."""
 
-    def __init__(self, items, enabled: bool):
+    def __init__(self, items, use_jpeg: bool, use_png: bool = False):
         self._cands = []
-        if enabled and jpeg.AVAILABLE:
+        self._jpeg = use_jpeg and jpeg.AVAILABLE
+        self._png = use_png
+        if self._jpeg or self._png:
             for i, (fs_path, _arc) in enumerate(items):
                 try:
                     st = fs_path.lstat()
                 except OSError:
                     continue
-                if not fs_path.is_symlink() and fs_path.is_file() and jpeg.is_candidate(fs_path, st.st_size):
+                if fs_path.is_symlink() or not fs_path.is_file():
+                    continue
+                if (self._jpeg and jpeg.is_candidate(fs_path, st.st_size)) or \
+                        (self._png and png.is_candidate(fs_path, st.st_size)):
                     self._cands.append(i)
         self._items = items
         self._futures: dict[int, object] = {}
@@ -102,14 +109,22 @@ class _JpegPrefetcher:
             self._futures[i] = self._pool.submit(self._work, self._items[i][0])
             self._next += 1
 
-    @staticmethod
-    def _work(path: Path):
+    def _work(self, path: Path):
+        """Return (original size, stored bytes, pax headers, kind) or None to store as-is."""
         try:
             data = path.read_bytes()
         except OSError:
             return None
-        jxl = jpeg.transcode(data)
-        return (len(data), jxl) if jxl is not None else None
+        if self._jpeg and path.suffix.lower() in jpeg.EXTENSIONS:
+            jxl = jpeg.transcode(data)
+            if jxl is not None:
+                return len(data), jxl, {jpeg.PAX_KEY: "1", jpeg.PAX_SIZE: str(len(data))}, "jpeg"
+        if self._png and path.suffix.lower() in png.EXTENSIONS:
+            raw = png.transcode(data)
+            if raw is not None:
+                return len(data), raw, {png.PAX_KEY: "1", png.PAX_SIZE: str(len(data)),
+                                        png.PAX_CRC: str(zlib.crc32(data))}, "png"
+        return None
 
     def get(self, i):
         fut = self._futures.pop(i, None)
@@ -127,18 +142,24 @@ class _JpegPrefetcher:
 
 
 def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = None,
-         jpeg_recompress: bool = False, stats: PackStats | None = None) -> list[str]:
+         jpeg_recompress: bool = False, stats: PackStats | None = None,
+         png_recompress: bool = False,
+         prelude: Callable[[tarfile.TarFile], None] | None = None) -> list[str]:
     """Write a tar stream of *paths* into *writer* (any object with .write).
 
     Symlinks that point inside the locked folder are kept (made relative).
     Links pointing elsewhere can't be restored safely, so a link to a file is
     stored as a copy of that file and anything else is skipped. Returns
     human-readable warnings about such cases.
+
+    *prelude(tf)* may write entries first (used to copy an existing archive).
     """
     stats = stats if stats is not None else PackStats()
     warnings = stats.warnings
     with tarfile.open(fileobj=writer, mode="w|", format=tarfile.PAX_FORMAT,
                       bufsize=READ_BLOCK) as tf:
+        if prelude:
+            prelude(tf)
 
         def add_file(fs_path, arcname, info=None):
             if info is None:
@@ -164,23 +185,26 @@ def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = Non
                     rel = Path(root).relative_to(real_root)
                     for name in dirs + sorted(files):
                         items.append((Path(root, name), str(Path(arc_root, rel, name))))
-            pre = _JpegPrefetcher(items, jpeg_recompress)
+            pre = _ImagePrefetcher(items, jpeg_recompress, png_recompress)
             try:
                 for i, (fs_path, arcname) in enumerate(items):
                     if not fs_path.is_symlink():
                         info = tf.gettarinfo(str(fs_path), arcname=arcname)
                         if info is None:  # sockets etc.
                             continue
-                        jx = pre.get(i) if info.isreg() else None
-                        if jx is not None and jx[0] == info.size:
-                            orig_size, jxl = jx
+                        tx = pre.get(i) if info.isreg() else None
+                        if tx is not None and tx[0] == info.size:
+                            orig_size, stored, pax, kind = tx
                             info.uid = info.gid = 0
                             info.uname = info.gname = ""
-                            info.size = len(jxl)
-                            info.pax_headers = {jpeg.PAX_KEY: "1", jpeg.PAX_SIZE: str(orig_size)}
-                            tf.addfile(info, io.BytesIO(jxl))
-                            stats.jpeg_files += 1
-                            stats.jpeg_saved += orig_size - len(jxl)
+                            info.size = len(stored)
+                            info.pax_headers = pax
+                            tf.addfile(info, io.BytesIO(stored))
+                            if kind == "jpeg":
+                                stats.jpeg_files += 1
+                                stats.jpeg_saved += orig_size - len(stored)
+                            else:
+                                stats.png_files += 1
                             if progress:
                                 progress(orig_size)
                         else:
@@ -214,24 +238,30 @@ def _drain(stream) -> None:
         pass
 
 
-def _is_jxl(m: tarfile.TarInfo) -> bool:
-    return m.isreg() and m.pax_headers.get(jpeg.PAX_KEY) == "1"
+def _is_transformed(m: tarfile.TarInfo) -> bool:
+    """True for a JPEG or PNG stored in recompressed form (restored on extraction)."""
+    return m.isreg() and (m.pax_headers.get(jpeg.PAX_KEY) == "1"
+                          or m.pax_headers.get(png.PAX_KEY) == "1")
 
 
-def _restore_jpeg(tf: tarfile.TarFile, m: tarfile.TarInfo) -> bytes:
+def _restore(tf: tarfile.TarFile, m: tarfile.TarInfo) -> bytes:
     try:
         size = int(m.pax_headers.get(jpeg.PAX_SIZE, ""))
+        crc = int(m.pax_headers[png.PAX_CRC]) if png.PAX_CRC in m.pax_headers else None
     except ValueError:
-        raise CorruptFileError("malformed recompressed-JPEG entry") from None
-    return jpeg.restore(tf.extractfile(m).read(), size)
+        raise CorruptFileError("malformed recompressed-image entry") from None
+    stored = tf.extractfile(m).read()
+    if m.pax_headers.get(jpeg.PAX_KEY) == "1":
+        return jpeg.restore(stored, size)
+    return png.restore(stored, size, crc)
 
 
-def _extract_jpeg(tf: tarfile.TarFile, m: tarfile.TarInfo, staging: Path) -> None:
+def _extract_transformed(tf: tarfile.TarFile, m: tarfile.TarInfo, staging: Path) -> None:
     try:
         safe = tarfile.data_filter(m, str(staging))
     except tarfile.FilterError as e:
         raise CorruptFileError(f"unsafe entry in archive: {e}") from e
-    data = _restore_jpeg(tf, m)
+    data = _restore(tf, m)
     target = staging / safe.name
     target.parent.mkdir(parents=True, exist_ok=True)
     if os.path.lexists(target):
@@ -255,8 +285,8 @@ def list_members(stream) -> list[tuple[str, int, bool]]:
                         tarfile.data_filter(m, fake_dest)
                     except tarfile.FilterError as e:
                         raise CorruptFileError(f"unsafe entry in archive: {e}") from e
-                    if _is_jxl(m):
-                        size = len(_restore_jpeg(tf, m))  # proves it restores exactly-sized
+                    if _is_transformed(m):
+                        size = len(_restore(tf, m))  # proves it restores exactly
                     else:
                         size = m.size
                         if m.isreg():
@@ -268,6 +298,41 @@ def list_members(stream) -> list[tuple[str, int, bool]]:
             raise CorruptFileError(f"archive is malformed: {e}") from e
     _drain(stream)
     return entries
+
+
+def top_name(name: str) -> str:
+    return name.strip("/").split("/", 1)[0]
+
+
+def copy_members(stream, tf: tarfile.TarFile, new_tops: set[str], replace: bool) -> set[str]:
+    """Copy every entry of the archive in *stream* into *tf* unchanged (for adding files).
+
+    Entries under a top-level name in *new_tops* clash with what is being added:
+    they are dropped when *replace* is set, otherwise it's an error. Returns the
+    top-level names that were dropped (replaced).
+    """
+    dropped: set[str] = set()
+    with tempfile.TemporaryDirectory() as fake_dest:
+        try:
+            with tarfile.open(fileobj=stream, mode="r|", bufsize=READ_BLOCK) as src:
+                for m in src:
+                    try:
+                        tarfile.data_filter(m, fake_dest)
+                    except tarfile.FilterError as e:
+                        raise CorruptFileError(f"unsafe entry in archive: {e}") from e
+                    top = top_name(m.name)
+                    if top in new_tops:
+                        if not replace:
+                            raise CrunchlockError(
+                                f"{top!r} is already in the locked file (choose “replace” to "
+                                "overwrite it, or rename what you're adding)")
+                        dropped.add(top)
+                        continue
+                    tf.addfile(m, src.extractfile(m) if m.isreg() else None)
+        except tarfile.TarError as e:
+            raise CorruptFileError(f"archive is malformed: {e}") from e
+    _drain(stream)
+    return dropped
 
 
 def _selected(name: str, only: list[str] | None) -> bool:
@@ -357,8 +422,8 @@ def extract(stream, dest: Path, force: bool = False, before_commit: Callable[[],
                         continue
                     if only is not None:
                         found.update(o for o in only if _selected(m.name, [o]))
-                    if _is_jxl(m):
-                        _extract_jpeg(tf, m, staging)
+                    if _is_transformed(m):
+                        _extract_transformed(tf, m, staging)
                         continue
                     try:
                         tf.extract(m, staging, filter="data")

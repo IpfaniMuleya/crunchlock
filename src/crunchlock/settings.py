@@ -22,7 +22,8 @@ DEFAULTS: dict = {
     "theme": None,            # None = follow the system, else "light" / "dark"
     "compress": True,
     "preset": 0,              # index into gui.PRESETS
-    "jpeg": True,
+    "jpeg": True,             # JPEG and PNG recompression
+    "long_range": False,
     "profile": "standard",
     "pad": False,
     "recovery": False,
@@ -32,6 +33,7 @@ DEFAULTS: dict = {
     "save_dir": "",           # last folder chosen for "lock each" output
     "extract_dir": "",        # last folder chosen to extract into
     "geometry": "",
+    "check_updates": False,   # opt-in: ask GitHub for the latest version at start
     "recent": [],             # recently used .clk files, newest first
 }
 # Never persist these, whatever a caller passes in.

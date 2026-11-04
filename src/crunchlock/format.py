@@ -32,7 +32,9 @@ MAX_CHUNK = 64 * 1024 * 1024
 # Header flags. Readers refuse files with flags they don't know, so an older
 # version never silently mis-extracts data it can't understand.
 FLAG_JPEG_XL = 0x01  # archive may contain JPEGs losslessly recompressed as JPEG XL
-KNOWN_FLAGS = FLAG_JPEG_XL
+FLAG_PNG = 0x02      # archive may contain PNGs stored with their pixel data unpacked
+FLAG_SIGNED = 0x04   # the last chunk is an Ed25519 signature of the plaintext stream
+KNOWN_FLAGS = FLAG_JPEG_XL | FLAG_PNG | FLAG_SIGNED
 
 SLOT_PASSWORD = 1
 SLOT_X25519 = 2
