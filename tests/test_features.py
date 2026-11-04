@@ -224,3 +224,24 @@ def test_stale_startup_lock_is_taken_over(tmp_path):
     old = time.time() - 60
     os.utime(lockfile, (old, old))
     assert not instance.hand_off_or_become_primary(["x"], tmp_path, wait=0.5)
+
+
+# ------------------------------------------------------------------ self-test
+
+def test_selftest_passes(tmp_path):
+    from crunchlock import selftest
+    result = tmp_path / "r.txt"
+    assert selftest.main([str(result)], gui=False) == 0
+    assert result.read_text().strip().endswith("OK")
+
+
+def test_selftest_reports_broken_bundle(tmp_path, monkeypatch):
+    from crunchlock import selftest
+
+    def broken(report):
+        raise ImportError("DLL load failed while importing _rust")
+    monkeypatch.setattr(selftest, "_check_imports", broken)
+    result = tmp_path / "r.txt"
+    assert selftest.main([str(result)], gui=False) == 1
+    text = result.read_text()
+    assert "FAILED" in text and "DLL load failed" in text
