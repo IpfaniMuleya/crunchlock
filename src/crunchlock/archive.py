@@ -256,9 +256,10 @@ def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = Non
                         if i in dups and info.isreg() and dups[i] in written \
                                 and _sha256_file(fs_path) == written[dups[i]]:
                             # Checked again now, in case a file changed since the scan.
-                            link = tarfile.TarInfo(arcname)
+                            # tar paths always use "/" (arcnames are built with os.sep)
+                            link = tarfile.TarInfo(arcname.replace(os.sep, "/"))
                             link.type = tarfile.LNKTYPE
-                            link.linkname = items[dups[i]][1]
+                            link.linkname = items[dups[i]][1].replace(os.sep, "/")
                             link.mode, link.mtime = info.mode, info.mtime
                             link.pax_headers = {PAX_DUP: "1", PAX_SIZE: str(info.size)}
                             tf.addfile(link)
