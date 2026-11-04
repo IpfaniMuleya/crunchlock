@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -57,22 +57,7 @@ jobs:
             python packaging/build.py
           fi
       - name: Smoke test (lock -> verify -> change password -> unlock round trip)
-        env:
-          CRUNCHLOCK_PASSWORD: ci-smoke-test-passphrase
-        run: |
-          mkdir -p smoke/in
-          seq 1 100000 > smoke/in/numbers.txt
-          cp README.md smoke/in/
-          python -c "from PIL import Image; import random; im = Image.effect_mandelbrot((800, 600), (-2, -1.2, 1, 1.2), 100).convert('RGB'); im.save('smoke/in/photo.jpg', quality=90)"
-          ./dist/crunchlock$EXE genpass
-          ./dist/crunchlock$EXE lock smoke/in -o smoke/t.clk -c best --recovery --pad --split 64K | tee smoke/lock.log
-          grep -q "JPEG photo(s) recompressed losslessly" smoke/lock.log
-          ./dist/crunchlock$EXE verify smoke/t.clk.001 -q
-          CRUNCHLOCK_PASSWORD_NEW=ci-new-passphrase ./dist/crunchlock$EXE rekey smoke/t.clk.001 -q
-          if ./dist/crunchlock$EXE verify smoke/t.clk.001 -q; then echo "old password still works"; exit 1; fi
-          CRUNCHLOCK_PASSWORD=ci-new-passphrase ./dist/crunchlock$EXE unlock smoke/t.clk.001 -o smoke/out -q
-          diff -r smoke/in smoke/out/in
-          echo "round trip OK"
+        run: packaging/smoke_test.sh
       - name: Build Windows installer
         if: runner.os == 'Windows'
         shell: pwsh
@@ -120,8 +105,6 @@ jobs:
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a "../package/$name.zip" crunchlock.exe CrunchlockGUI.exe
-          elif [ "$RUNNER_OS" = "macOS" ]; then
-            tar czf "../package/$name.tar.gz" crunchlock CrunchlockGUI.app
           else
             tar czf "../package/$name.tar.gz" crunchlock CrunchlockGUI
           fi
@@ -131,9 +114,51 @@ jobs:
           path: package/*
           if-no-files-found: error
 
+  # macOS is built separately so that a slow or unavailable GitHub macOS machine
+  # never holds up (or fails) a release: the Windows and Linux files are attached
+  # by the `release` job, and this job attaches the macOS file itself whenever it
+  # finishes. A macOS failure shows as a red job but doesn't fail the workflow.
+  build-macos:
+    needs: test
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (exact pinned build versions)
+        run: |
+          pip install -r packaging/requirements-build.txt
+          pip install --no-deps .
+      - name: Build executables and self-test both (CLI + GUI)
+        run: python packaging/build.py
+      - name: Smoke test (lock -> verify -> change password -> unlock round trip)
+        run: packaging/smoke_test.sh
+      - name: Package
+        run: |
+          mkdir -p package
+          cd dist && tar czf "../package/crunchlock-macOS-${{ runner.arch }}.tar.gz" crunchlock CrunchlockGUI.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crunchlock-macOS
+          path: package/*
+          if-no-files-found: error
+      - name: Attach to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: package/*
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: build  # Windows + Linux only; macOS attaches its own file (see build-macos)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -141,6 +166,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: crunchlock-{Windows,Windows-installer,Linux}
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
