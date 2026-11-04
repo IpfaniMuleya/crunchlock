@@ -329,13 +329,17 @@ def verify(path: str | Path, *, password=None, keyfile=None, identity=None,
 
 
 def unlock(path: str | Path, dest: str | Path | None = None, *, password=None, keyfile=None,
-           identity=None, force: bool = False, progress: Progress = None) -> UnlockResult:
+           identity=None, force: bool = False, only: Iterable[str] | None = None,
+           progress: Progress = None) -> UnlockResult:
+    """Decrypt and extract. *only*: archive paths (from verify()/list) to extract;
+    the rest is skipped and chosen files are merged into *dest*."""
     path = Path(path)
     dest = Path(dest) if dest else path.resolve().parent
     decomp, finish, rs, mr = _open(path, password=password, keyfile=keyfile, identity=identity,
                                    progress=progress)
     try:
-        extracted = archive.extract(decomp, dest, force, before_commit=finish)
+        extracted = archive.extract(decomp, dest, force, before_commit=finish,
+                                    only=list(only) if only is not None else None)
     finally:
         mr.close()
     return UnlockResult(extracted, compress.NAMES[decomp.algo], rs.corrected_bytes if rs else 0)
@@ -399,6 +403,94 @@ def rekey(path: str | Path, *, password: str | None = None, keyfile: bytes | Non
     mr.close()  # release the old files before replacing them (required on Windows)
     outputs = sink.commit()
     return RekeyResult(outputs, keys.describe_slots(new_header))
+
+
+def lock_each(paths: Iterable[str | Path], output_dir: str | Path | None = None, *,
+              progress: Progress = None, **options) -> list[LockResult]:
+    """Lock every item into its own .clk file (batch mode).
+
+    Each file goes to *output_dir* (default: next to the item) as ``<name>.clk``.
+    Takes the same options as lock(). Stops at the first error or cancel; files
+    already finished are kept and returned in the exception's ``done`` attribute.
+    """
+    items = archive.check_inputs([Path(p) for p in paths])
+    outs = []
+    for p in items:
+        name = p.resolve().name if p.name in ("", ".", "..") else p.name
+        outs.append((Path(output_dir) if output_dir else p.resolve().parent) / (name + EXT))
+    if len({o.resolve() for o in outs}) != len(outs):
+        raise CrunchlockError("two items would get the same output name; use separate folders")
+    if output_dir:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+    results: list[LockResult] = []
+    n = len(items)
+    for i, (p, out) in enumerate(zip(items, outs), 1):
+        def item_progress(stage, done, total, _i=i):
+            if progress:
+                progress(f"{stage} ({_i}/{n})", done, total)
+        try:
+            results.append(lock([p], out, progress=item_progress, **options))
+        except BaseException as e:
+            e.done = results  # type: ignore[attr-defined]
+            raise
+    return results
+
+
+@dataclass
+class RepairResult:
+    outputs: list[Path]
+    repaired_bytes: int
+
+    @property
+    def was_damaged(self) -> bool:
+        return self.repaired_bytes > 0
+
+
+def repair(path: str | Path, output: str | Path | None = None, *, force: bool = False,
+           progress: Progress = None) -> RepairResult:
+    """Write a repaired copy of a damaged .clk using its recovery data.
+
+    No password is needed: recovery data protects the encrypted bytes. The copy
+    keeps the recovery data (and the split layout). Nothing is written when no
+    damage is found. Unlock or verify the copy to confirm it is authentic.
+    """
+    parts = resolve_parts(Path(path))
+    split_size = parts[0].stat().st_size if len(parts) > 1 else None
+    base = parts[0].with_name(parts[0].name[:-4]) if len(parts) > 1 else parts[0]
+    if output:
+        out = Path(output)
+    else:
+        stem = base.name[:-len(EXT)] if base.name.endswith(EXT) else base.name
+        out = base.with_name(stem + ".repaired" + EXT)
+    mr = MultiReader(parts)
+    sink = None
+    try:
+        stream, rs = recovery.open_layer(mr)
+        if rs is None:
+            raise CrunchlockError("this file has no recovery data, so damage can only be detected, "
+                                  "not repaired (lock with --recovery to allow repairs)")
+        sink = OutputSink(out, split_size, force)
+        writer = recovery.RSWriter(sink, rs.cols)
+        total, done = mr.total, 0
+        while True:
+            chunk = stream.read(1 << 20)
+            if not chunk:
+                break
+            writer.write(chunk)
+            done += len(chunk)
+            if progress:
+                progress("repairing", min(done, total), total)
+        writer.close()
+    except BaseException:
+        mr.close()
+        if sink:
+            sink.abort()
+        raise
+    mr.close()
+    if rs.corrected_bytes == 0:
+        sink.abort()
+        return RepairResult([], 0)
+    return RepairResult(sink.commit(), rs.corrected_bytes)
 
 
 def info(path: str | Path) -> dict:

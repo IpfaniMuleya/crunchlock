@@ -28,6 +28,7 @@ except Exception:  # noqa: BLE001 - drag and drop is optional
 from . import api, instance, jpeg, kdf, keys, passgen
 from .cli import human
 from .errors import CancelledError, CrunchlockError, WrongKeyError
+from .eta import Eta, format_eta
 from .shred import WARNING as SHRED_WARNING
 from .split import parse_size
 
@@ -380,6 +381,7 @@ class Status(ttk.Frame):
         self.label = ttk.Label(self, text="", wraplength=760, justify="left")
         self.action = ttk.Button(self, text="")
         self.label.pack(fill="x")
+        self.eta = Eta()
 
     def progress(self, stage, done, total):
         if not self.bar.winfo_ismapped():
@@ -392,7 +394,9 @@ class Status(ttk.Frame):
             self.bar.configure(mode="determinate")
             self.bar.stop()
             self.bar["value"] = 1000 * done / total
-            self.label["text"] = f"{stage.capitalize()}…  {100 * done / total:.0f}%  ({human(done)})"
+            left = format_eta(self.eta.update(stage, done, total))
+            self.label["text"] = (f"{stage[:1].upper() + stage[1:]}…  {100 * done / total:.0f}%  "
+                                  f"({human(done)})" + (f"  ·  {left}" if left else ""))
         else:
             self.bar.configure(mode="indeterminate")
             self.bar.start(12)
@@ -547,9 +551,16 @@ class LockTab(ScrollFrame):
         ttk.Checkbutton(sp, text="Split into parts of", variable=self.split).pack(side="left")
         ttk.Entry(sp, textvariable=self.split_size, width=7).pack(side="left", padx=6)
         ttk.Checkbutton(opt, text="Securely delete the originals afterwards", variable=self.shred).grid(row=1, column=1, sticky="w", pady=3, padx=(GAP, 0))
+        self.each = tk.BooleanVar()
+        ttk.Checkbutton(opt, text="Lock each item into its own .clk file (instead of one bundle)",
+                        variable=self.each, command=self._sync_output).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=3)
 
         # Output + action
         out = card(b, "Save as")
+        self.out_title = out.header.winfo_children()[0]
+        self.out_hint = ttk.Label(out, text="", style="Muted.TLabel")
+        self.out_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self.output = tk.StringVar()
         ttk.Entry(out, textvariable=self.output).grid(row=0, column=0, sticky="we", padx=(0, 8))
         ttk.Button(out, text="Browse…", command=self.browse_output).grid(row=0, column=1)
@@ -586,7 +597,7 @@ class LockTab(ScrollFrame):
             self.empty.place_forget()
             total = api.archive.total_size([Path(p) for p in self.paths.values()])
             self.total["text"] = f"{len(self.paths)} item(s) · {human(total)}"
-            if not self.output.get():
+            if not self.output.get() and not getattr(self, "each", tk.BooleanVar()).get():
                 self.output.set(str(api.default_output([Path(p) for p in self.paths.values()])))
         else:
             self.empty.place(in_=self.tree, relx=0.5, rely=0.6, anchor="center")
@@ -604,7 +615,23 @@ class LockTab(ScrollFrame):
             self.paths.pop(iid, None)
         self._refresh()
 
+    def _sync_output(self):
+        if self.each.get():
+            self.out_title.configure(text="Save to folder")
+            self.out_hint.configure(text="Each item becomes <name>.clk. Leave empty to save each "
+                                         "one next to the original.")
+            self.output.set("")
+        else:
+            self.out_title.configure(text="Save as")
+            self.out_hint.configure(text="")
+            self._refresh()
+
     def browse_output(self):
+        if self.each.get():
+            p = filedialog.askdirectory(title="Save the locked files in")
+            if p:
+                self.output.set(p)
+            return
         p = filedialog.asksaveasfilename(title="Save locked file as", defaultextension=".clk",
                                          filetypes=[("Crunchlock file", "*.clk")])
         if p:
@@ -638,7 +665,17 @@ class LockTab(ScrollFrame):
             _, algo, level = next(p for p in PRESETS if p[0] == self.preset.get())
             output = self.output.get() or None
             force = False
-            if output and Path(output).exists():
+            each = self.each.get()
+            if each:
+                dests = [(Path(output) if output else Path(p).parent) / (Path(p).name + api.EXT)
+                         for p in paths]
+                existing = [d.name for d in dests if d.exists()]
+                if existing and not messagebox.askyesno(
+                        "Replace files?", "These already exist and will be replaced:\n"
+                        + "\n".join(existing[:10]), parent=self):
+                    return
+                force = bool(existing)
+            elif output and Path(output).exists():
                 if not messagebox.askyesno("Replace file?", f"{output} already exists. Replace it?", parent=self):
                     return
                 force = True
@@ -655,19 +692,31 @@ class LockTab(ScrollFrame):
         self.button.state(["disabled"])
         self.app.worker.on_progress = self.status.progress
         self.app.worker.on_done = self.done
-        self.app.worker.start(lambda prog: api.lock(paths, output, progress=prog, **kwargs))
+        if each:
+            self.app.worker.start(lambda prog: api.lock_each(paths, output, progress=prog, **kwargs))
+        else:
+            self.app.worker.start(lambda prog: api.lock(paths, output, progress=prog, **kwargs))
         self.after(150, self.scroll_to_end)
 
     def done(self, result, error):
         self.button.state(["!disabled"])
+        finished = getattr(error, "done", None) or []
         if isinstance(error, CancelledError):
-            self.status.cancelled()
+            if finished:
+                self.status.show(f"Cancelled after {len(finished)} item(s); those were kept, "
+                                 "the one in progress was not written.", "info")
+            else:
+                self.status.cancelled()
             return
         if error:
-            self.status.show(f"Lock failed: {error}", "error")
+            extra = f" ({len(finished)} item(s) before it were locked and kept)" if finished else ""
+            self.status.show(f"Lock failed: {error}{extra}", "error")
             self.after(50, self.scroll_to_end)
             return
         self.pwbox.clear()
+        if isinstance(result, list):
+            self._done_each(result)
+            return
         msg = (f"✓  Locked  {human(result.input_bytes)} → {human(result.output_bytes)}"
                + (f"   ({result.saved_percent:.0f}% smaller)" if result.saved_percent > 0 else ""))
         if result.compression_note:
@@ -686,6 +735,98 @@ class LockTab(ScrollFrame):
         first = result.outputs[0]
         self.status.show(msg, "ok", ("Show in folder", lambda: open_in_file_manager(first)))
         self.after(50, self.scroll_to_end)
+
+
+    def _done_each(self, results):
+        total_in = sum(r.input_bytes for r in results)
+        total_out = sum(r.output_bytes for r in results)
+        saved = 100 * (1 - total_out / total_in) if total_in else 0
+        msg = (f"✓  Locked {len(results)} item(s) separately  {human(total_in)} → {human(total_out)}"
+               + (f"   ({saved:.0f}% smaller)" if saved > 0 else ""))
+        for r in results[:8]:
+            msg += f"\n  {r.outputs[0].name}  ({human(r.output_bytes)})"
+        if len(results) > 8:
+            msg += f"\n  … and {len(results) - 8} more"
+        for w in [w for r in results for w in r.warnings]:
+            msg += f"\n⚠ {w}"
+        if any(r.shredded for r in results):
+            msg += "\nOriginals securely deleted."
+            self.tree.delete(*self.tree.get_children())
+            self.paths.clear()
+            self._refresh()
+        first = results[0].outputs[0]
+        self.status.show(msg, "ok", ("Show in folder", lambda: open_in_file_manager(first)))
+        self.after(50, self.scroll_to_end)
+
+
+class ContentsDialog(tk.Toplevel):
+    """Shows the files inside a locked file and lets the user extract some of them."""
+
+    def __init__(self, tab, entries):
+        super().__init__(tab)
+        self.tab = tab
+        self.title("Contents")
+        self.transient(tab.winfo_toplevel())
+        self.geometry("620x480")
+        body = ttk.Frame(self, padding=GAP)
+        body.pack(fill="both", expand=True)
+        files = [e for e in entries if not e[2]]
+        ttk.Label(body, text=f"{len(files)} file(s), {human(sum(e[1] for e in files))}. "
+                             "Select files or folders (Ctrl/Shift-click for several).",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
+        frame = ttk.Frame(body)
+        frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(frame, columns=("size",), selectmode="extended")
+        self.tree.heading("#0", text="Name", anchor="w")
+        self.tree.heading("size", text="Size", anchor="e")
+        self.tree.column("size", width=100, stretch=False, anchor="e")
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self._fill(entries)
+        bar = ttk.Frame(body)
+        bar.pack(fill="x", pady=(GAP, 0))
+        ttk.Button(bar, text="Extract selected", style="Accent.TButton",
+                   command=self.extract_selected).pack(side="right")
+        ttk.Button(bar, text="Extract everything", command=self.extract_all).pack(side="right", padx=8)
+        ttk.Button(bar, text="Close", command=self.destroy).pack(side="left")
+        self.configure(background=tab.app.colors["bg"])
+
+    def _fill(self, entries):
+        def ensure(path: str):
+            if not path or self.tree.exists(path):
+                return
+            parent = path.rsplit("/", 1)[0] if "/" in path else ""
+            ensure(parent)
+            self.tree.insert(parent, "end", iid=path, text="📁 " + path.rsplit("/", 1)[-1], open=False)
+        for name, size, is_dir in entries:
+            name = name.rstrip("/")
+            if is_dir:
+                ensure(name)
+                continue
+            parent = name.rsplit("/", 1)[0] if "/" in name else ""
+            ensure(parent)
+            if not self.tree.exists(name):
+                self.tree.insert(parent, "end", iid=name, text="📄 " + name.rsplit("/", 1)[-1],
+                                 values=(human(size),))
+        for top in self.tree.get_children():
+            self.tree.item(top, open=True)
+
+    def extract_selected(self):
+        chosen = list(self.tree.selection())
+        if not chosen:
+            messagebox.showinfo("Nothing selected", "Select one or more files or folders first.",
+                                parent=self)
+            return
+        # Drop items already covered by a selected parent folder.
+        chosen = [c for c in chosen if not any(c.startswith(o + "/") for o in chosen if o != c)]
+        self.destroy()
+        self.tab.run(only=chosen)
+
+    def extract_all(self):
+        self.destroy()
+        self.tab.run()
 
 
 class UnlockTab(ScrollFrame):
@@ -730,6 +871,8 @@ class UnlockTab(ScrollFrame):
         self.unlock_btn.pack(side="right", ipady=4)
         self.verify_btn = ttk.Button(bar, text="Check only", command=lambda: self.run(verify=True))
         self.verify_btn.pack(side="right", padx=8, ipady=4)
+        self.browse_btn = ttk.Button(bar, text="Browse contents…", command=lambda: self.run(browse=True))
+        self.browse_btn.pack(side="right", ipady=4)
         self.status = Status(b, app)
         self.status.pack(fill="x", pady=(GAP, 0))
         self.file.trace_add("write", lambda *_: self.show_info())
@@ -755,6 +898,17 @@ class UnlockTab(ScrollFrame):
         self.apply_btn = ttk.Button(cc, text="Apply changes", style="Accent.TButton", command=self.rekey)
         self.apply_btn.grid(row=5, column=2, sticky="e", pady=(8, 0))
 
+        damaged = Collapsible(b, "File damaged? Repair it")
+        damaged.pack(fill="x", pady=(GAP, 0))
+        dc = card(damaged.content, "Repair", "uses the file's damage-recovery data")
+        ttk.Label(dc, style="Card.TLabel", justify="left", wraplength=640, text=(
+            "Writes a repaired copy next to the file (name.repaired.clk); the original is not "
+            "changed. No password is needed to repair. If you enter the password above, the "
+            "copy is also checked. Only works for files locked with damage-recovery data."
+        )).pack(fill="x")
+        self.repair_btn = ttk.Button(dc, text="Repair", style="Accent.TButton", command=self.repair)
+        self.repair_btn.pack(anchor="e", pady=(8, 0))
+
     def _current_secrets(self):
         keyfile = Path(self.keyfile.get()).read_bytes() if self.keyfile.get() else None
         identity = (api.load_identity(self.identity.get(), self.idpw.value())
@@ -762,7 +916,7 @@ class UnlockTab(ScrollFrame):
         return self.pwbox.value() or None, keyfile, identity
 
     def _buttons(self, enabled: bool):
-        for btn in (self.verify_btn, self.unlock_btn, self.apply_btn):
+        for btn in (self.verify_btn, self.unlock_btn, self.apply_btn, self.browse_btn, self.repair_btn):
             btn.state(["!disabled"] if enabled else ["disabled"])
 
     def rekey(self):
@@ -840,7 +994,53 @@ class UnlockTab(ScrollFrame):
                              + f" · opens with: {how}"
                              + (" · has recovery data" if m["recovery_data"] else ""))
 
-    def run(self, verify=False):
+    def repair(self):
+        if self.app.worker.busy:
+            return
+        f = self.file.get()
+        if not f:
+            self.status.show("Choose a .clk file first.", "error")
+            return
+        try:
+            password, keyfile, identity = self._current_secrets()
+        except (CrunchlockError, OSError) as e:
+            self.status.show(f"Can't repair yet: {e}", "error")
+            return
+
+        def job(prog):
+            r = api.repair(f, progress=prog)
+            check = None
+            if r.was_damaged and (password or keyfile is not None or identity is not None):
+                check = api.verify(r.outputs[0], password=password, keyfile=keyfile,
+                                   identity=identity, progress=prog)
+            return r, check
+
+        self._buttons(False)
+        self.app.worker.on_progress = self.status.progress
+        self.app.worker.on_done = self._repair_done
+        self.app.worker.start(job)
+
+    def _repair_done(self, result, error):
+        self._buttons(True)
+        if isinstance(error, CancelledError):
+            self.status.cancelled()
+            return
+        if error:
+            prefix = "Wrong password or key" if isinstance(error, WrongKeyError) else "Couldn't repair"
+            self.status.show(f"{prefix}: {error}", "error")
+            return
+        r, check = result
+        if not r.was_damaged:
+            self.status.show("✓  No damage found. The file is fine, so nothing was written.", "ok")
+            return
+        msg = f"✓  Repaired {r.repaired_bytes} damaged bytes  →  {r.outputs[0].name}"
+        msg += ("\nThe repaired copy opens with your password and is authentic." if check else
+                "\nEnter the password and click Check only on the repaired copy to confirm it.")
+        first = r.outputs[0]
+        self.file.set(str(first))
+        self.status.show(msg, "ok", ("Show in folder", lambda: open_in_file_manager(first)))
+
+    def run(self, verify=False, browse=False, only=None):
         if self.app.worker.busy:
             return
         try:
@@ -858,16 +1058,16 @@ class UnlockTab(ScrollFrame):
             return
         self._buttons(False)
         self.app.worker.on_progress = self.status.progress
-        self.app.worker.on_done = lambda r, e: self.done(r, e, verify)
-        if verify:
+        self.app.worker.on_done = lambda r, e: self.done(r, e, verify, browse)
+        if verify or browse:
             job = lambda prog: api.verify(f, password=password, keyfile=keyfile,  # noqa: E731
                                           identity=identity, progress=prog)
         else:
             job = lambda prog: api.unlock(f, dest, password=password, keyfile=keyfile,  # noqa: E731
-                                          identity=identity, force=force, progress=prog)
+                                          identity=identity, force=force, only=only, progress=prog)
         self.app.worker.start(job)
 
-    def done(self, result, error, verify):
+    def done(self, result, error, verify, browse=False):
         self._buttons(True)
         if isinstance(error, CancelledError):
             self.status.cancelled()
@@ -876,6 +1076,10 @@ class UnlockTab(ScrollFrame):
             prefix = "Wrong password or key" if isinstance(error, WrongKeyError) else "Failed"
             self.status.show(f"{prefix}: {error}", "error")
             return
+        if browse:
+            self.status.show("Opened. Pick what to extract in the window.", "ok")
+            ContentsDialog(self, result.entries)
+            return  # keep the password filled in for the extraction
         self.pwbox.clear()
         self.idpw.clear()
         repaired = (f"\nRepaired {result.repaired_bytes} damaged bytes using the recovery data."

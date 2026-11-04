@@ -30,6 +30,9 @@ key), and restores them byte-for-byte.
 | Remove the originals | `--shred` (only after the new file is verified) |
 | Change the password / recipients | `crunchlock rekey file.clk` (no recompression needed) |
 | Keep photos untouched | `--no-jpeg` (turns off lossless JPEG recompression) |
+| See what's inside / take out one file | `crunchlock list file.clk`, then `unlock file.clk --only docs/report.pdf` |
+| Lock files one by one | `crunchlock lock *.pdf --each -o locked/` → one `.clk` per item |
+| Fix a damaged file | `crunchlock repair file.clk` → `file.repaired.clk` (needs `--recovery`; no password needed) |
 
 ## Download (no Python needed)
 
@@ -135,16 +138,20 @@ crunchlock-gui
 
 It follows your system's light or dark mode, and you can switch with the button in the header.
 **Drag and drop** files or folders onto the window to lock them. Drop a `.clk` file to unlock
-it. Long operations show a progress bar with a **Cancel** button; cancelling removes any
-partial output.
+it. Long operations show a progress bar with the **time left** and a **Cancel** button; cancelling
+removes any partial output.
 
 The window has three tabs:
 - **Lock:** add files/folders, choose a compression preset (or switch compression off), and
   optionally shrink JPEG photos losslessly. Set a password (with a strength meter and
   *Generate* button). Under *Advanced options*: keyfile, recipients, padding, recovery data,
   splitting and secure delete.
-- **Unlock:** pick a `.clk` (or `.clk.001`), then *Check only* or *Unlock*. **Change the
-  password or who can open the file** under the section of that name.
+- **Unlock:** pick a `.clk` (or `.clk.001`), then *Check only* or *Unlock*. Click **Browse
+  contents…** to see what's inside and extract only the files you pick. **Change the
+  password or who can open the file**, or **repair a damaged file**, in the sections of
+  those names.
+- Under *Advanced options* on the Lock tab, **Lock each item into its own .clk file** turns a
+  list of files into separate locked files instead of one bundle.
 - **Passphrases & keys:** a passphrase generator (copied passphrases are cleared from the
   clipboard after 30 s) and key-pair creation.
 

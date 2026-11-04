@@ -270,19 +270,93 @@ def list_members(stream) -> list[tuple[str, int, bool]]:
     return entries
 
 
-def extract(stream, dest: Path, force: bool = False, before_commit: Callable[[], None] | None = None) -> list[Path]:
+def _selected(name: str, only: list[str] | None) -> bool:
+    if only is None:
+        return True
+    name = name.rstrip("/")
+    return any(name == o or name.startswith(o + "/") for o in only)
+
+
+def _commit_whole(staging: Path, dest: Path, force: bool) -> list[Path]:
+    """Move each top-level entry into *dest* (full extraction)."""
+    names = sorted(os.listdir(staging))
+    clashes = [n for n in names if os.path.lexists(dest / n)]
+    if clashes and not force:
+        raise CrunchlockError("refusing to overwrite existing: " + ", ".join(clashes)
+                              + " (use --force or choose another output folder)")
+    out = []
+    for n in names:
+        target = dest / n
+        if os.path.lexists(target):
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        os.replace(staging / n, target)
+        out.append(target)
+    return out
+
+
+def _commit_merge(staging: Path, dest: Path, force: bool) -> list[Path]:
+    """Merge extracted files into *dest* file by file (selective extraction).
+
+    Existing folders are kept; only the chosen files are added or replaced, so
+    picking one file never wipes a folder that is already there.
+    """
+    entries = []
+    for root, dirs, files in os.walk(staging):
+        for name in files + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+            entries.append(Path(root, name).relative_to(staging))
+        for d in dirs:
+            p = Path(root, d)
+            if not p.is_symlink() and not any(p.iterdir()):
+                entries.append(p.relative_to(staging))  # empty folder
+    clashes = [str(e) for e in entries
+               if os.path.lexists(dest / e) and not (dest / e).is_dir()]
+    if clashes and not force:
+        raise CrunchlockError("refusing to overwrite existing: " + ", ".join(sorted(clashes)[:10])
+                              + (" …" if len(clashes) > 10 else "")
+                              + " (use --force or choose another output folder)")
+    out = []
+    for e in sorted(entries):
+        src, target = staging / e, dest / e
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir() and not src.is_symlink():
+            target.mkdir(exist_ok=True)
+        else:
+            if os.path.lexists(target):
+                target.unlink()
+            os.replace(src, target)
+        out.append(target)
+    return out
+
+
+def extract(stream, dest: Path, force: bool = False, before_commit: Callable[[], None] | None = None,
+            only: list[str] | None = None) -> list[Path]:
     """Extract into a hidden staging dir, then move into *dest* only once complete.
 
     *before_commit* is called after the archive is fully read; it must raise if
     the data failed authentication. Nothing appears in *dest* until then.
+
+    *only*: archive paths (files or folders, as shown by list_members) to
+    extract; everything else is skipped. Selected files are merged into *dest*.
     """
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
+    if only is not None:
+        only = [o.strip().strip("/").replace("\\", "/") for o in only if o.strip().strip("/")]
+        if not only:
+            raise CrunchlockError("nothing selected to extract")
+    found: set[str] = set()
     staging = Path(tempfile.mkdtemp(prefix=".crunchlock-", dir=dest))
     try:
         try:
             with tarfile.open(fileobj=stream, mode="r|", bufsize=READ_BLOCK) as tf:
                 for m in tf:
+                    if not _selected(m.name, only):
+                        continue
+                    if only is not None:
+                        found.update(o for o in only if _selected(m.name, [o]))
                     if _is_jxl(m):
                         _extract_jpeg(tf, m, staging)
                         continue
@@ -295,21 +369,11 @@ def extract(stream, dest: Path, force: bool = False, before_commit: Callable[[],
         _drain(stream)
         if before_commit:
             before_commit()
-        names = sorted(os.listdir(staging))
-        clashes = [n for n in names if os.path.lexists(dest / n)]
-        if clashes and not force:
-            raise CrunchlockError("refusing to overwrite existing: " + ", ".join(clashes)
-                                  + " (use --force or choose another output folder)")
-        out = []
-        for n in names:
-            target = dest / n
-            if os.path.lexists(target):
-                if target.is_dir() and not target.is_symlink():
-                    shutil.rmtree(target)
-                else:
-                    target.unlink()
-            os.replace(staging / n, target)
-            out.append(target)
-        return out
+        if only is None:
+            return _commit_whole(staging, dest, force)
+        missing = [o for o in only if o not in found]
+        if missing:
+            raise CrunchlockError("not found in the locked file: " + ", ".join(missing))
+        return _commit_merge(staging, dest, force)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
