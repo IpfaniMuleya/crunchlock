@@ -11,9 +11,10 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 from . import archive, compress, kdf, keys, recovery
 from .crypto import DecryptReader, EncryptWriter
 from . import jpeg as jpeg_codec
+from . import png as png_codec
 from .crypto import reencrypt
 from .errors import CancelledError, CorruptFileError, CrunchlockError, WrongKeyError  # noqa: F401 (re-export)
-from .format import FLAG_JPEG_XL, Header, PasswordSlot, read_header
+from .format import FLAG_JPEG_XL, FLAG_PNG, FLAG_SIGNED, Header, PasswordSlot, X25519Slot, read_header
 from .shred import shred
 from .split import MultiReader, OutputSink, resolve_parts
 
@@ -36,6 +37,8 @@ class LockResult:
     warnings: list[str] = field(default_factory=list)
     jpeg_files: int = 0
     jpeg_saved: int = 0
+    png_files: int = 0
+    signed_by: str | None = None  # fingerprint of the signing key
 
     @property
     def saved_percent(self) -> float:
@@ -49,6 +52,7 @@ class UnlockResult:
     extracted: list[Path]
     compression: str
     repaired_bytes: int = 0
+    signed_by: str | None = None  # fingerprint of the key that signed it, if signed
 
 
 @dataclass
@@ -56,6 +60,7 @@ class VerifyResult:
     entries: list[tuple[str, int, bool]]
     compression: str
     repaired_bytes: int = 0
+    signed_by: str | None = None
 
     @property
     def total_bytes(self) -> int:
@@ -92,15 +97,15 @@ def default_output(paths: list[Path]) -> Path:
     return first.resolve().parent / (name + EXT)
 
 
-def _looks_incompressible(paths, progress: Progress) -> bool:
-    """Quick check on the first few MB using a fast compressor."""
+def _looks_incompressible(paths, progress: Progress, use_png: bool = False) -> bool:
+    """Quick check on the first few MB using a fast compressor (PNGs as they'd be stored)."""
     sink = compress.CountingSink()
     w = compress.CompressWriter(sink, compress.ZSTD, 3)
     tap = _Tee([w], SAMPLE_BYTES)
     if progress:
         progress("analyzing", 0, 1)
     try:
-        archive.pack(paths, tap)
+        archive.pack(paths, tap, png_recompress=use_png)
     except _StopSampling:
         pass
     w.close()
@@ -116,24 +121,30 @@ def _validate_level(algo: int, level: int | None) -> None:
 
 
 class _Pipeline:
-    """tar bytes -> compress -> encrypt (+pad) -> [Reed-Solomon] -> file(s)."""
+    """tar bytes -> compress -> encrypt (+pad, +signature) -> [Reed-Solomon] -> file(s)."""
 
     def __init__(self, out: Path, algo: int, level: int | None, *, password, keyfile, recipients,
-                 params, pad, recovery_data, split_size, force, flags=0):
+                 params, pad, recovery_data, split_size, force, flags=0, sign_with=None,
+                 size_hint=None, long_range=False, rs_cols=None):
         self.file_key = keys.new_file_key()
+        if sign_with is not None:
+            flags |= FLAG_SIGNED
         header = Header(chunk_size=CHUNK_SIZE, nonce_prefix=os.urandom(7), flags=flags)
         prefix = header.prefix()
         if password or keyfile is not None:
             header.slots.append(keys.make_password_slot(prefix, self.file_key, password, keyfile, params))
         for r in recipients:
             header.slots.append(keys.make_x25519_slot(prefix, self.file_key, r))
+        self.header = header
         self.algo = algo
         self.sink = OutputSink(out, split_size, force)
         try:
-            target = recovery.RSWriter(self.sink) if recovery_data else self.sink
-            enc = EncryptWriter(target, header.pack(), self.file_key, CHUNK_SIZE,
-                                header.nonce_prefix, pad)
-            self.writer = compress.CompressWriter(enc, algo, level)
+            target = (recovery.RSWriter(self.sink, rs_cols or recovery.DEFAULT_COLS)
+                      if recovery_data else self.sink)
+            self.enc = EncryptWriter(target, header.pack(), self.file_key, CHUNK_SIZE,
+                                     header.nonce_prefix, pad,
+                                     sign_with.signing_key if sign_with is not None else None)
+            self.writer = compress.CompressWriter(self.enc, algo, level, size_hint, long_range)
         except BaseException:
             self.sink.abort()
             raise
@@ -154,12 +165,18 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
          level: int | None = None, kdf_profile: str | kdf.KdfParams = "standard",
          pad: bool = False, recovery_data: bool = False, split_size: int | None = None,
          shred_originals: bool = False, force: bool = False, jpeg: bool = True,
+         png: bool = True, long_range: bool = False, sign_with: keys.Identity | None = None,
          progress: Progress = None) -> LockResult:
     """Compress (optionally) and encrypt *paths* into one ``.clk`` file (or parts).
 
     compression: "zstd" (default), "xz", "best" (tries both, keeps the smaller) or "none".
-    jpeg: losslessly recompress JPEG photos (~20% smaller, exact bytes restored);
-    only applies when compression is on.
+    jpeg / png: losslessly recompress JPEG photos (~20% smaller) and PNG images
+    (often 20-50% smaller); the exact original bytes are restored. Only applies
+    when compression is on.
+    long_range: let zstd find repeats up to 1 GiB apart (big backups, disk images);
+    unlocking then needs up to 1 GiB of memory. The window always grows to 128 MiB
+    for big inputs.
+    sign_with: your key pair; recipients can check the file came from you.
 
     *progress* may raise CancelledError to abort; partial output is removed.
     """
@@ -183,7 +200,7 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
     else:
         if mode != "best":
             _validate_level(compress.BY_NAME[mode], level)
-        if _looks_incompressible(paths, progress):
+        if _looks_incompressible(paths, progress, png and png_codec.available()):
             algos = [compress.NONE]
             note = "data looks already compressed (e.g. photos/videos/zip); stored without compression"
         elif mode == "best":
@@ -192,11 +209,15 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
             algos = [compress.BY_NAME[mode]]
 
     use_jpeg = jpeg and mode != "none" and jpeg_codec.AVAILABLE
+    # Unpacked PNG pixels must be compressed, or the file would grow.
+    use_png = png and algos != [compress.NONE] and png_codec.available()
     if progress:
         progress("deriving key", 0, 1)
+    total = archive.total_size(paths)
     common = dict(password=password, keyfile=keyfile, recipients=recipients, params=params,
                   pad=pad, recovery_data=recovery_data, split_size=split_size, force=force,
-                  flags=FLAG_JPEG_XL if use_jpeg else 0)
+                  flags=(FLAG_JPEG_XL if use_jpeg else 0) | (FLAG_PNG if use_png else 0),
+                  sign_with=sign_with, size_hint=total, long_range=long_range)
     pipes: list[_Pipeline] = []
     try:
         if len(algos) == 1:
@@ -206,7 +227,6 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
             # outputs (no plaintext ever touches the disk), and keep the smaller one.
             pipes.append(_Pipeline(out, compress.ZSTD, level, **common))
             pipes.append(_Pipeline(out, compress.LZMA, None, **common))
-        total = archive.total_size(paths)
         done = [0]
 
         def cb(n):
@@ -216,7 +236,7 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
 
         stats = archive.PackStats()
         warnings = archive.pack(paths, pipes[0] if len(pipes) == 1 else _Tee(pipes), cb,
-                                jpeg_recompress=use_jpeg, stats=stats)
+                                jpeg_recompress=use_jpeg, stats=stats, png_recompress=use_png)
         for pipe in pipes:
             pipe.finish()
         best = min(pipes, key=lambda pp: pp.sink.total)
@@ -237,8 +257,13 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
         photo_note = (f"{stats.jpeg_files} JPEG photo(s) recompressed losslessly, "
                       f"saving {stats.jpeg_saved / 1048576:.1f} MB")
         note = photo_note if not note or note.startswith("data looks") else f"{note}; {photo_note}"
+    if stats.png_files:
+        png_note = f"{stats.png_files} PNG image(s) repacked losslessly"
+        note = f"{note}; {png_note}" if note else png_note
     result = LockResult(outputs, total, best.sink.total, compress.NAMES[best.algo], note,
-                        warnings=warnings, jpeg_files=stats.jpeg_files, jpeg_saved=stats.jpeg_saved)
+                        warnings=warnings, jpeg_files=stats.jpeg_files, jpeg_saved=stats.jpeg_saved,
+                        png_files=stats.png_files,
+                        signed_by=keys.fingerprint(sign_with.verify_key) if sign_with else None)
     if shred_originals:
         # Only destroy the originals after proving the new file opens correctly.
         # The output is already committed, so cancelling is no longer possible.
@@ -283,9 +308,32 @@ def _open_header(parts, password=None, keyfile=None, identity=None, file_key=Non
     return mr, stream, rs, header, raw, file_key
 
 
+def _expected_signer(signer) -> bytes | None:
+    """Accept an Ed25519 public key, a clkpub2 text/.clkpub path or an Identity."""
+    if signer is None:
+        return None
+    if isinstance(signer, keys.Identity):
+        signer = signer.verify_key
+    if isinstance(signer, (str, Path)):
+        signer = load_verify_key(str(signer))
+    return signer.public_bytes_raw()
+
+
+def _check_signer(dec: DecryptReader, expected: bytes | None) -> None:
+    if expected is None:
+        return
+    if dec.signer is None:
+        raise CrunchlockError("this file is not signed, but only files signed by "
+                              f"{keys.fingerprint(expected)} were to be accepted")
+    if dec.signer != expected:
+        raise CrunchlockError(f"this file was signed by {keys.fingerprint(dec.signer)}, "
+                              f"not by the expected {keys.fingerprint(expected)}")
+
+
 def _open(path_or_parts, password=None, keyfile=None, identity=None, file_key=None, progress=None,
-          stage="unlocking"):
+          stage="unlocking", signer=None):
     parts = path_or_parts if isinstance(path_or_parts, list) else resolve_parts(Path(path_or_parts))
+    expected = _expected_signer(signer)
     mr, stream, rs, header, raw, file_key = _open_header(parts, password, keyfile, identity,
                                                          file_key, progress)
     total = mr.total
@@ -295,7 +343,8 @@ def _open(path_or_parts, password=None, keyfile=None, identity=None, file_key=No
             progress(stage, min(n, total), total)
 
     try:
-        dec = DecryptReader(stream, raw, file_key, header.chunk_size, header.nonce_prefix, cb)
+        dec = DecryptReader(stream, raw, file_key, header.chunk_size, header.nonce_prefix, cb,
+                            signed=bool(header.flags & FLAG_SIGNED))
         decomp = compress.DecompressReader(dec)
     except BaseException:
         mr.close()
@@ -307,42 +356,53 @@ def _open(path_or_parts, password=None, keyfile=None, identity=None, file_key=No
         dec.read_all_and_discard()
         if not dec.finished:
             raise CorruptFileError("file is truncated")
+        _check_signer(dec, expected)
 
-    return decomp, finish, rs, mr
+    return decomp, finish, rs, mr, dec
+
+
+def _signed_by(dec: DecryptReader) -> str | None:
+    return keys.fingerprint(dec.signer) if dec.signer else None
 
 
 def _open_and_verify(parts, **kw) -> VerifyResult:
-    decomp, finish, rs, mr = _open(parts, **kw)
+    decomp, finish, rs, mr, dec = _open(parts, **kw)
     try:
         entries = archive.list_members(decomp)
         finish()
     finally:
         mr.close()
-    return VerifyResult(entries, compress.NAMES[decomp.algo], rs.corrected_bytes if rs else 0)
+    return VerifyResult(entries, compress.NAMES[decomp.algo], rs.corrected_bytes if rs else 0,
+                        _signed_by(dec))
 
 
-def verify(path: str | Path, *, password=None, keyfile=None, identity=None,
+def verify(path: str | Path, *, password=None, keyfile=None, identity=None, signer=None,
            progress: Progress = None) -> VerifyResult:
-    """Fully decrypt and check a file (integrity + password) without writing anything."""
+    """Fully decrypt and check a file (integrity + password) without writing anything.
+
+    *signer*: only accept the file if it was signed by this key (a clkpub2 public
+    key text or .clkpub file, or an Ed25519 public key)."""
     return _open_and_verify(Path(path), password=password, keyfile=keyfile, identity=identity,
-                            progress=progress, stage="verifying")
+                            progress=progress, stage="verifying", signer=signer)
 
 
 def unlock(path: str | Path, dest: str | Path | None = None, *, password=None, keyfile=None,
            identity=None, force: bool = False, only: Iterable[str] | None = None,
-           progress: Progress = None) -> UnlockResult:
+           signer=None, progress: Progress = None) -> UnlockResult:
     """Decrypt and extract. *only*: archive paths (from verify()/list) to extract;
-    the rest is skipped and chosen files are merged into *dest*."""
+    the rest is skipped and chosen files are merged into *dest*. *signer*: see verify().
+    Nothing is written unless the file is authentic (and signed by *signer*)."""
     path = Path(path)
     dest = Path(dest) if dest else path.resolve().parent
-    decomp, finish, rs, mr = _open(path, password=password, keyfile=keyfile, identity=identity,
-                                   progress=progress)
+    decomp, finish, rs, mr, dec = _open(path, password=password, keyfile=keyfile, identity=identity,
+                                        progress=progress, signer=signer)
     try:
         extracted = archive.extract(decomp, dest, force, before_commit=finish,
                                     only=list(only) if only is not None else None)
     finally:
         mr.close()
-    return UnlockResult(extracted, compress.NAMES[decomp.algo], rs.corrected_bytes if rs else 0)
+    return UnlockResult(extracted, compress.NAMES[decomp.algo], rs.corrected_bytes if rs else 0,
+                        _signed_by(dec))
 
 
 @dataclass
@@ -391,7 +451,8 @@ def rekey(path: str | Path, *, password: str | None = None, keyfile: bytes | Non
             if progress:
                 progress("re-encrypting", min(n, total), total)
 
-        dec = DecryptReader(stream, raw, old_key, header.chunk_size, header.nonce_prefix, cb)
+        dec = DecryptReader(stream, raw, old_key, header.chunk_size, header.nonce_prefix, cb,
+                            signed=bool(header.flags & FLAG_SIGNED))
         sink = OutputSink(base, split_size, force=True)
         target = recovery.RSWriter(sink, rs.cols) if rs else sink
         reencrypt(dec, target, new_header.pack(), new_key, new_header.nonce_prefix)
@@ -520,6 +581,8 @@ def info(path: str | Path) -> dict:
         "chunk_size": header.chunk_size,
         "recovery_data": rs is not None,
         "jpeg_recompression": bool(header.flags & FLAG_JPEG_XL),
+        "png_recompression": bool(header.flags & FLAG_PNG),
+        "signed": bool(header.flags & FLAG_SIGNED),
         "key_slots": slots,
         "needs_keyfile": keys.needs_keyfile(header),
     }
@@ -529,8 +592,151 @@ def load_identity(path: str | Path, passphrase: str) -> keys.Identity:
     return keys.load_private_key(Path(path).read_bytes(), passphrase)
 
 
+def _public_text(text_or_path: str) -> str:
+    text = text_or_path.strip()
+    if not text.startswith((keys.PUB_PREFIX, keys.PUB2_PREFIX)) and Path(text).exists():
+        text = Path(text).read_text("utf-8")
+    return text
+
+
 def load_recipient(text_or_path: str) -> X25519PublicKey:
-    p = Path(text_or_path)
-    if not text_or_path.startswith(keys.PUB_PREFIX) and p.exists():
-        text_or_path = p.read_text("utf-8")
-    return keys.public_key_from_text(text_or_path)
+    return keys.public_key_from_text(_public_text(text_or_path))
+
+
+def load_verify_key(text_or_path: str):
+    """The signature-check key from a clkpub2 public key (text or .clkpub file)."""
+    return keys.verify_key_from_text(_public_text(text_or_path))
+
+
+# ---------------------------------------------------------------- add files
+
+@dataclass
+class AddResult:
+    outputs: list[Path]
+    added: list[Path]
+    replaced: list[str]
+    output_bytes: int
+    warnings: list[str] = field(default_factory=list)
+    signed_by: str | None = None
+
+
+def add(path: str | Path, items: Iterable[str | Path], *, password: str | None = None,
+        keyfile: bytes | None = None, identity=None, recipients: Iterable[X25519PublicKey] = (),
+        replace: bool = False, sign_with: keys.Identity | None = None, jpeg: bool = True,
+        png: bool = True, progress: Progress = None) -> AddResult:
+    """Add files/folders to an existing locked file, without unpacking it to disk.
+
+    The old contents are decrypted and streamed straight into a new file together
+    with the new items; the original is replaced only after the whole old file has
+    been authenticated. Compression method, padding, recovery data, split layout
+    and password hardening are kept.
+
+    Access: a password slot is kept (it needs the password/keyfile); public-key
+    recipients can't be read back from a file, so if the file is shared with
+    public keys they must be given again in *recipients* (your own key is added
+    automatically when you open the file with it). The file gets a new key.
+
+    *replace*: allow items whose name is already in the file to replace it.
+    A signature can't survive a change of contents; pass *sign_with* to re-sign.
+    """
+    new_paths = archive.check_inputs([Path(p) for p in items])
+    new_tops = {p.resolve().name if p.name in ("", ".", "..") else p.name for p in new_paths}
+    recipients = list(recipients)
+    parts = resolve_parts(Path(path))
+    for p in new_paths:
+        rp = p.resolve()
+        if any(rp == q.resolve() or (rp.is_dir() and rp in q.resolve().parents) for q in parts):
+            raise CrunchlockError("you can't add the locked file to itself")
+    split_size = parts[0].stat().st_size if len(parts) > 1 else None
+    base = parts[0].with_name(parts[0].name[:-4]) if len(parts) > 1 else parts[0]
+    mr, stream, rs, header, raw, file_key = _open_header(parts, password, keyfile, identity,
+                                                         progress=progress)
+    pw_slots = [s for s in header.slots if isinstance(s, PasswordSlot)]
+    x_slots = sum(isinstance(s, X25519Slot) for s in header.slots)
+    if identity is not None:
+        mine = _identity_key(identity).public_key()
+        if not any(r.public_bytes_raw() == mine.public_bytes_raw() for r in recipients):
+            recipients.append(mine)
+    try:
+        if pw_slots and not password and keyfile is None:
+            raise CrunchlockError("this file also opens with a password; enter it too, so the "
+                                  "updated file keeps it")
+        if pw_slots and keyfile is None and pw_slots[0].uses_keyfile:
+            raise CrunchlockError("this file needs its keyfile; choose it too")
+        if len(recipients) < x_slots:
+            raise CrunchlockError(
+                f"this file is shared with {x_slots} public key(s). Crunchlock can't read them "
+                "back from the file, so add those public keys again as recipients")
+        if not pw_slots and not recipients:
+            raise CrunchlockError("the updated file needs a password or at least one public key")
+        if pw_slots and identity is not None:
+            # Opened with the private key: make sure the password given is the real
+            # one before it becomes the only password of the updated file.
+            keys.open_file_key(header, password, keyfile, None)
+    except BaseException:
+        mr.close()
+        raise
+
+    old_signed = bool(header.flags & FLAG_SIGNED)
+    sink_holder: list[_Pipeline] = []
+    try:
+        total_new = archive.total_size(new_paths)
+        old_total = mr.total
+        state = {"old": 0, "new": 0}
+
+        def report():
+            if progress:
+                progress("adding", min(state["old"] + state["new"], old_total + total_new),
+                         old_total + total_new)
+
+        def old_cb(n):
+            state["old"] = min(n, old_total)
+            report()
+
+        def new_cb(n):
+            state["new"] += n
+            report()
+
+        dec = DecryptReader(stream, raw, file_key, header.chunk_size, header.nonce_prefix, old_cb,
+                            signed=old_signed)
+        decomp = compress.DecompressReader(dec)
+        algo = decomp.algo
+        use_jpeg = jpeg and jpeg_codec.AVAILABLE and algo != compress.NONE
+        use_png = png and png_codec.available() and algo != compress.NONE
+        flags = (header.flags & ~FLAG_SIGNED) | (FLAG_JPEG_XL if use_jpeg else 0) \
+            | (FLAG_PNG if use_png else 0)
+        params = pw_slots[0].params if pw_slots else kdf.PROFILES["standard"]
+        pipe = _Pipeline(base, algo, None, password=password if pw_slots else None,
+                         keyfile=keyfile if pw_slots else None, recipients=recipients,
+                         params=params, pad=False, recovery_data=rs is not None,
+                         split_size=split_size, force=True, flags=flags, sign_with=sign_with,
+                         size_hint=old_total + total_new, rs_cols=rs.cols if rs else None)
+        sink_holder.append(pipe)
+        replaced: set[str] = set()
+
+        def prelude(tf):
+            replaced.update(archive.copy_members(decomp, tf, new_tops, replace))
+
+        stats = archive.PackStats()
+        warnings = archive.pack(new_paths, pipe, new_cb, jpeg_recompress=use_jpeg, stats=stats,
+                                png_recompress=use_png, prelude=prelude)
+        # The old file must be fully authentic before anything replaces it.
+        if dec.read(1):
+            raise CorruptFileError("unexpected data after the end of the compressed stream")
+        dec.read_all_and_discard()
+        if not dec.finished:
+            raise CorruptFileError("file is truncated")
+        pipe.enc.pad = dec.padding_bytes > 0  # keep size hiding if the old file had it
+        pipe.finish()
+    except BaseException:
+        mr.close()
+        for pp in sink_holder:
+            pp.sink.abort()
+        raise
+    mr.close()  # release the old files before replacing them (required on Windows)
+    outputs = pipe.sink.commit()
+    if old_signed and sign_with is None:
+        warnings.append("the old signature was removed because the contents changed; "
+                        "sign it again to let others check it's from you")
+    return AddResult(outputs, new_paths, sorted(replaced), pipe.sink.total, warnings,
+                     keys.fingerprint(sign_with.verify_key) if sign_with else None)

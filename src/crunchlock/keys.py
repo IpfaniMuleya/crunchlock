@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -16,7 +17,8 @@ from . import kdf
 from .errors import CorruptFileError, CrunchlockError, WrongKeyError
 from .format import Header, PasswordSlot, X25519Slot
 
-PUB_PREFIX = "clkpub1:"
+PUB_PREFIX = "clkpub1:"   # X25519 only (version 1.0.x)
+PUB2_PREFIX = "clkpub2:"  # X25519 + Ed25519 signature-check key
 KEYFILE_MAGIC = b"CLKK"
 _KEYFILE = struct.Struct(">4sBIIB16s12s")
 _SLOT_AAD = b"crunchlock-slot-v1"
@@ -118,38 +120,85 @@ def needs_keyfile(header: Header) -> bool:
 
 @dataclass
 class Identity:
+    """A key pair: X25519 to receive files, plus an Ed25519 key to sign them.
+
+    The signing key is derived from the same private key (HKDF with its own
+    label), so existing key files can sign without any change.
+    """
     private: X25519PrivateKey
 
     @property
     def public(self) -> X25519PublicKey:
         return self.private.public_key()
 
+    @property
+    def signing_key(self) -> Ed25519PrivateKey:
+        raw = self.private.private_bytes(serialization.Encoding.Raw,
+                                         serialization.PrivateFormat.Raw,
+                                         serialization.NoEncryption())
+        seed = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                    info=b"crunchlock ed25519 signing key v1").derive(raw)
+        return Ed25519PrivateKey.from_private_bytes(seed)
+
+    @property
+    def verify_key(self) -> Ed25519PublicKey:
+        return self.signing_key.public_key()
+
 
 def generate_identity() -> Identity:
     return Identity(X25519PrivateKey.generate())
 
 
-def public_key_to_text(pub: X25519PublicKey) -> str:
-    return PUB_PREFIX + base64.urlsafe_b64encode(pub.public_bytes_raw()).decode().rstrip("=")
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
-def public_key_from_text(text: str) -> X25519PublicKey:
+def public_key_to_text(key: "Identity | X25519PublicKey") -> str:
+    """Shareable public key. For an Identity this includes the signature-check key
+    (``clkpub2:``); a bare X25519 key gives the older ``clkpub1:`` form."""
+    if isinstance(key, Identity):
+        return PUB2_PREFIX + _b64(key.public.public_bytes_raw() + key.verify_key.public_bytes_raw())
+    return PUB_PREFIX + _b64(key.public_bytes_raw())
+
+
+def parse_public_text(text: str) -> tuple[X25519PublicKey, Ed25519PublicKey | None]:
     text = text.strip()
-    if not text.startswith(PUB_PREFIX):
-        raise CrunchlockError("not a crunchlock public key (expected 'clkpub1:...')")
-    body = text[len(PUB_PREFIX):]
+    for prefix, size in ((PUB2_PREFIX, 64), (PUB_PREFIX, 32)):
+        if text.startswith(prefix):
+            break
+    else:
+        raise CrunchlockError("not a crunchlock public key (expected 'clkpub2:...' or 'clkpub1:...')")
+    body = text[len(prefix):]
     try:
         raw = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
     except ValueError as e:
         raise CrunchlockError("malformed public key") from e
-    if len(raw) != 32:
+    if len(raw) != size:
         raise CrunchlockError("malformed public key")
-    return X25519PublicKey.from_public_bytes(raw)
+    try:
+        x = X25519PublicKey.from_public_bytes(raw[:32])
+        ed = Ed25519PublicKey.from_public_bytes(raw[32:]) if size == 64 else None
+    except ValueError as e:
+        raise CrunchlockError("malformed public key") from e
+    return x, ed
 
 
-def fingerprint(pub: X25519PublicKey) -> str:
+def public_key_from_text(text: str) -> X25519PublicKey:
+    return parse_public_text(text)[0]
+
+
+def verify_key_from_text(text: str) -> Ed25519PublicKey:
+    ed = parse_public_text(text)[1]
+    if ed is None:
+        raise CrunchlockError("this public key (clkpub1) is from an older version and can't check "
+                              "signatures; ask its owner for a new one (crunchlock pubkey)")
+    return ed
+
+
+def fingerprint(pub: "X25519PublicKey | Ed25519PublicKey | bytes") -> str:
+    raw = pub if isinstance(pub, bytes) else pub.public_bytes_raw()
     h = hashes.Hash(hashes.SHA256())
-    h.update(pub.public_bytes_raw())
+    h.update(raw)
     d = h.finalize().hex()[:16]
     return ":".join(d[i:i + 4] for i in range(0, 16, 4))
 

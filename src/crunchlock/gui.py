@@ -7,11 +7,12 @@ import subprocess
 import sys
 import threading
 import traceback
+import webbrowser
 from pathlib import Path
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import filedialog, messagebox, simpledialog, ttk
 except ImportError:  # pragma: no cover
     tk = None
 
@@ -25,7 +26,7 @@ try:
 except Exception:  # noqa: BLE001 - drag and drop is optional
     TkinterDnD = None
 
-from . import api, instance, jpeg, kdf, keys, passgen
+from . import __version__, api, instance, kdf, keys, passgen, update
 from .settings import Settings
 from .cli import human
 from .errors import CancelledError, CrunchlockError, WrongKeyError
@@ -456,6 +457,36 @@ class RecipientList(ttk.Frame):
         return [api.load_recipient(self.paths[i]) for i in self.tree.get_children()]
 
 
+class SignBox(ttk.Frame):
+    """Optional: your private key + its passphrase, to sign a file."""
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.key = tk.StringVar()
+        labeled_entry(self, 0, "Your private key", self.key, self.browse)
+        self.pw = PasswordBox(self, app, confirm=False, label="Key passphrase", generate=False)
+        self.pw.grid(row=1, column=0, columnspan=3, sticky="we", pady=(4, 0))
+        ttk.Label(self, style="Muted.TLabel", wraplength=600, justify="left", text=(
+            "Leave empty to not sign. People who have your public key can then check the "
+            "file really came from you and wasn't changed.")).grid(
+            row=2, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(4, 0))
+
+    def browse(self):
+        p = filedialog.askopenfilename(title="Your private key", filetypes=[
+            ("Crunchlock private key", "*.clkkey"), ("All files", "*")])
+        if p:
+            self.key.set(p)
+
+    def identity(self):
+        """The loaded key pair, or None when not signing. Raises WrongKeyError."""
+        if not self.key.get():
+            return None
+        return api.load_identity(self.key.get(), self.pw.value())
+
+    def clear(self):
+        self.pw.clear()
+
+
 def labeled_entry(master, row, label, var, browse=None, button="Browse…"):
     ttk.Label(master, text=label, style="Card.TLabel").grid(row=row, column=0, sticky="w", pady=4)
     ttk.Entry(master, textvariable=var).grid(row=row, column=1, sticky="we", padx=(10, 8), pady=4)
@@ -508,11 +539,17 @@ class LockTab(ScrollFrame):
         self.preset_cb.grid(row=1, column=0, sticky="w", pady=(10, 0))
         self.chint = ttk.Label(comp, text="", style="Muted.TLabel")
         self.chint.grid(row=1, column=1, sticky="w", padx=10, pady=(10, 0))
-        self.jpeg = tk.BooleanVar(value=jpeg.AVAILABLE)
+        self.jpeg = tk.BooleanVar(value=True)
         self.jpeg_cb = ttk.Checkbutton(
             comp, variable=self.jpeg,
-            text="Shrink JPEG photos losslessly (about 20% smaller, restored byte-for-byte)")
+            text="Shrink JPEG and PNG images losslessly (restored byte-for-byte)")
         self.jpeg_cb.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.long_range = tk.BooleanVar(value=False)
+        self.long_cb = ttk.Checkbutton(
+            comp, variable=self.long_range,
+            text="Find repeats far apart in big files (backups, disk images; "
+                 "unlocking needs up to 1 GB of memory)")
+        self.long_cb.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # Password
         prot = card(b, "Protection", "AES-256 encryption is always on")
@@ -538,6 +575,10 @@ class LockTab(ScrollFrame):
         self.profile = tk.StringVar(value="standard")
         ttk.Combobox(sec, textvariable=self.profile, values=["standard", "paranoid", "light"],
                      state="readonly", width=12).grid(row=3, column=1, sticky="w", padx=(10, 0), pady=(8, 4))
+
+        sig = card(a, "Signature", "prove the file came from you")
+        self.sign = SignBox(sig, app)
+        self.sign.pack(fill="x")
 
         opt = card(a, "File options")
         self.pad = tk.BooleanVar()
@@ -579,7 +620,8 @@ class LockTab(ScrollFrame):
     def _sync(self):
         on = self.compress.get()
         self.preset_cb.configure(state="readonly" if on else "disabled")
-        self.jpeg_cb.state(["!disabled"] if on and jpeg.AVAILABLE else ["disabled"])
+        for cb in (self.jpeg_cb, self.long_cb):
+            cb.state(["!disabled"] if on else ["disabled"])
         self.chint["text"] = "" if on else "Files will only be encrypted."
 
     def _add(self, paths):
@@ -688,7 +730,13 @@ class LockTab(ScrollFrame):
                           level=level if self.compress.get() else None,
                           kdf_profile=self.profile.get(), pad=self.pad.get(),
                           recovery_data=self.recovery.get(), split_size=split,
-                          shred_originals=self.shred.get(), force=force, jpeg=self.jpeg.get())
+                          shred_originals=self.shred.get(), force=force, jpeg=self.jpeg.get(),
+                          png=self.jpeg.get(), long_range=self.long_range.get(),
+                          sign_with=self.sign.identity())
+        except WrongKeyError as e:
+            self.status.show(f"Can't sign: {e}", "error")
+            self.after(50, self.scroll_to_end)
+            return
         except (CrunchlockError, OSError, ValueError) as e:
             self.status.show(f"Can't lock yet: {e}", "error")
             self.after(50, self.scroll_to_end)
@@ -718,6 +766,7 @@ class LockTab(ScrollFrame):
             self.after(50, self.scroll_to_end)
             return
         self.pwbox.clear()
+        self.sign.clear()
         outs = [r.outputs[0] for r in result] if isinstance(result, list) else [result.outputs[0]]
         for o in outs:
             self.app.settings.add_recent(o)
@@ -733,6 +782,8 @@ class LockTab(ScrollFrame):
             msg += f"\nSaved as {len(result.outputs)} parts: {result.outputs[0].name} … {result.outputs[-1].name}"
         else:
             msg += f"\nSaved as {result.outputs[0].name}"
+        if result.signed_by:
+            msg += f"\nSigned with your key ({result.signed_by})"
         for w in result.warnings:
             msg += f"\n⚠ {w}"
         if result.shredded:
@@ -876,6 +927,20 @@ class UnlockTab(ScrollFrame):
         self.idpw = PasswordBox(kk, app, confirm=False, label="Key passphrase")
         self.idpw.grid(row=2, column=0, columnspan=3, sticky="we", pady=(4, 0))
 
+        sigc = Collapsible(b, "Check who signed it")
+        sigc.pack(fill="x", pady=(0, GAP))
+        sc = card(sigc.content, "Expected sender", "optional")
+        self.signer = tk.StringVar()
+        labeled_entry(sc, 0, "Their public key", self.signer,
+                      lambda: self.signer.set(filedialog.askopenfilename(
+                          title="The sender's public key",
+                          filetypes=[("Crunchlock public key", "*.clkpub"), ("All files", "*")])
+                          or self.signer.get()))
+        ttk.Label(sc, style="Muted.TLabel", wraplength=600, justify="left", text=(
+            "If set, the file is only opened when it was signed with this person's key. "
+            "Either way, the result shows who signed it.")).grid(
+            row=1, column=1, columnspan=2, sticky="w", padx=(10, 0))
+
         bar = ttk.Frame(b)
         bar.pack(fill="x")
         self.unlock_btn = ttk.Button(bar, text="🔓   Unlock", style="Accent.TButton", command=self.run, width=16)
@@ -909,6 +974,37 @@ class UnlockTab(ScrollFrame):
         self.apply_btn = ttk.Button(cc, text="Apply changes", style="Accent.TButton", command=self.rekey)
         self.apply_btn.grid(row=5, column=2, sticky="e", pady=(8, 0))
 
+        addc = Collapsible(b, "Add files to this locked file")
+        addc.pack(fill="x", pady=(GAP, 0))
+        ac = card(addc.content, "Add files", "first enter the password or key above")
+        self.add_tree = ttk.Treeview(ac, show="tree", height=3)
+        self.add_tree.grid(row=0, column=0, columnspan=3, sticky="we")
+        self.add_paths: dict[str, str] = {}
+        ab = ttk.Frame(ac)
+        ab.grid(row=1, column=0, columnspan=3, sticky="we", pady=(8, 0))
+        ttk.Button(ab, text="＋  Add files", command=lambda: self._add_items(
+            filedialog.askopenfilenames(title="Files to add"))).pack(side="left")
+        ttk.Button(ab, text="＋  Add folder", command=lambda: self._add_items(
+            [filedialog.askdirectory(title="Folder to add")])).pack(side="left", padx=8)
+        ttk.Button(ab, text="Remove", command=self._remove_items).pack(side="left")
+        self.add_replace = tk.BooleanVar()
+        ttk.Checkbutton(ac, text="Replace items that are already in the file under the same name",
+                        variable=self.add_replace).grid(row=2, column=0, columnspan=3, sticky="w",
+                                                        pady=(8, 0))
+        ttk.Label(ac, text="Shared with", style="Card.TLabel").grid(row=3, column=0, sticky="nw", pady=6)
+        self.add_recips = RecipientList(ac)
+        self.add_recips.grid(row=3, column=1, columnspan=2, sticky="we", padx=(10, 0), pady=6)
+        ttk.Label(ac, style="Muted.TLabel", wraplength=600, justify="left", text=(
+            "If this file can be opened with other people's public keys, add their keys here "
+            "again (they can't be read back from the file). Your own key is kept automatically.")
+        ).grid(row=4, column=1, columnspan=2, sticky="w", padx=(10, 0))
+        self.add_sign = SignBox(ac, app)
+        self.add_sign.grid(row=5, column=0, columnspan=3, sticky="we", pady=(8, 0))
+        self.add_btn = ttk.Button(ac, text="Add to locked file", style="Accent.TButton",
+                                  command=self.add_files)
+        self.add_btn.grid(row=6, column=2, sticky="e", pady=(8, 0))
+        ac.columnconfigure(1, weight=1)
+
         damaged = Collapsible(b, "File damaged? Repair it")
         damaged.pack(fill="x", pady=(GAP, 0))
         dc = card(damaged.content, "Repair", "uses the file's damage-recovery data")
@@ -927,8 +1023,80 @@ class UnlockTab(ScrollFrame):
         return self.pwbox.value() or None, keyfile, identity
 
     def _buttons(self, enabled: bool):
-        for btn in (self.verify_btn, self.unlock_btn, self.apply_btn, self.browse_btn, self.repair_btn):
+        for btn in (self.verify_btn, self.unlock_btn, self.apply_btn, self.browse_btn,
+                    self.repair_btn, self.add_btn):
             btn.state(["!disabled"] if enabled else ["disabled"])
+
+    # -- add files to the locked file
+
+    def _add_items(self, paths):
+        for p in paths:
+            if p and p not in self.add_paths.values():
+                pp = Path(p)
+                iid = self.add_tree.insert("", "end", text=("📁 " if pp.is_dir() else "📄 ") + pp.name)
+                self.add_paths[iid] = p
+
+    def _remove_items(self):
+        for iid in self.add_tree.selection():
+            self.add_tree.delete(iid)
+            self.add_paths.pop(iid, None)
+
+    def add_files(self):
+        if self.app.worker.busy:
+            return
+        try:
+            f = self.file.get()
+            if not f:
+                raise CrunchlockError("choose a .clk file first")
+            items = list(self.add_paths.values())
+            if not items:
+                raise CrunchlockError("choose the files or folders to add")
+            password, keyfile, identity = self._current_secrets()
+            recips = self.add_recips.keys()
+            signer = self.add_sign.identity()
+        except WrongKeyError as e:
+            self.status.show(f"Wrong private-key passphrase: {e}", "error")
+            return
+        except (CrunchlockError, OSError) as e:
+            self.status.show(f"Can't add yet: {e}", "error")
+            return
+        replace = self.add_replace.get()
+        self._buttons(False)
+        self.app.worker.on_progress = self.status.progress
+        self.app.worker.on_done = self._add_done
+        self.app.worker.start(lambda prog: api.add(
+            f, items, password=password, keyfile=keyfile, identity=identity, recipients=recips,
+            replace=replace, sign_with=signer, progress=prog))
+        self.after(150, self.scroll_to_end)
+
+    def _add_done(self, result, error):
+        self._buttons(True)
+        if isinstance(error, CancelledError):
+            self.status.show("Cancelled. The locked file was not changed.", "info")
+            return
+        if error:
+            prefix = "Wrong password or key" if isinstance(error, WrongKeyError) else "Couldn't add"
+            self.status.show(f"{prefix}: {error} (the locked file was not changed)", "error")
+            self.after(50, self.scroll_to_end)
+            return
+        for box in (self.pwbox, self.idpw):
+            box.clear()
+        self.add_sign.clear()
+        self.add_tree.delete(*self.add_tree.get_children())
+        self.add_paths.clear()
+        self.remember(self.file.get())
+        self.show_info()
+        msg = (f"✓  Added {len(result.added)} item(s) to {result.outputs[0].name}"
+               f"  (now {human(result.output_bytes)})")
+        if result.replaced:
+            msg += "\nReplaced: " + ", ".join(result.replaced)
+        if result.signed_by:
+            msg += f"\nSigned with your key ({result.signed_by})"
+        for w in result.warnings:
+            msg += f"\n⚠ {w}"
+        first = result.outputs[0]
+        self.status.show(msg, "ok", ("Show in folder", lambda: open_in_file_manager(first)))
+        self.after(50, self.scroll_to_end)
 
     def rekey(self):
         if self.app.worker.busy:
@@ -1035,7 +1203,8 @@ class UnlockTab(ScrollFrame):
         self.info["text"] = (f"{human(m['size'])}"
                              + (f" in {len(m['parts'])} parts" if len(m["parts"]) > 1 else "")
                              + f" · opens with: {how}"
-                             + (" · has recovery data" if m["recovery_data"] else ""))
+                             + (" · has recovery data" if m["recovery_data"] else "")
+                             + (" · signed" if m["signed"] else ""))
 
     def repair(self):
         if self.app.worker.busy:
@@ -1094,6 +1263,9 @@ class UnlockTab(ScrollFrame):
             password, keyfile, identity = self._current_secrets()
             dest = self.dest.get() or None
             force = self.force.get()
+            signer = self.signer.get().strip() or None
+            if signer:
+                api.load_verify_key(signer)  # fail early on a bad or old-format key
         except WrongKeyError as e:
             self.status.show(f"Wrong private-key passphrase: {e}", "error")
             return
@@ -1102,16 +1274,17 @@ class UnlockTab(ScrollFrame):
             return
         self._buttons(False)
         self.app.worker.on_progress = self.status.progress
-        self.app.worker.on_done = lambda r, e: self.done(r, e, verify, browse)
+        self.app.worker.on_done = lambda r, e: self.done(r, e, verify, browse, signer)
         if verify or browse:
             job = lambda prog: api.verify(f, password=password, keyfile=keyfile,  # noqa: E731
-                                          identity=identity, progress=prog)
+                                          identity=identity, signer=signer, progress=prog)
         else:
             job = lambda prog: api.unlock(f, dest, password=password, keyfile=keyfile,  # noqa: E731
-                                          identity=identity, force=force, only=only, progress=prog)
+                                          identity=identity, force=force, only=only,
+                                          signer=signer, progress=prog)
         self.app.worker.start(job)
 
-    def done(self, result, error, verify, browse=False):
+    def done(self, result, error, verify, browse=False, signer=None):
         self._buttons(True)
         if isinstance(error, CancelledError):
             self.status.cancelled()
@@ -1129,6 +1302,12 @@ class UnlockTab(ScrollFrame):
         self.idpw.clear()
         repaired = (f"\nRepaired {result.repaired_bytes} damaged bytes using the recovery data."
                     if result.repaired_bytes else "")
+        if result.signed_by:
+            repaired += (f"\n✓ Signed by the expected sender ({result.signed_by})" if signer else
+                         f"\nSigned by key {result.signed_by} (compare it with the sender's "
+                         "signing fingerprint)")
+        else:
+            repaired += "\nNot signed."
         if verify:
             n = sum(1 for e in result.entries if not e[2])
             self.status.show(f"✓  Authentic and intact: {n} file(s), {human(result.total_bytes)}{repaired}", "ok")
@@ -1166,8 +1345,12 @@ class ToolsTab(ScrollFrame):
         labeled_entry(k, 0, "Save as", self.kname, self.browse_key)
         self.kpw = PasswordBox(k, app, confirm=True, label="Passphrase")
         self.kpw.grid(row=1, column=0, columnspan=3, sticky="we", pady=(6, 0))
-        ttk.Button(k, text="Create key pair", style="Accent.TButton", command=self.keygen).grid(
-            row=2, column=2, sticky="e", pady=(10, 0))
+        kb = ttk.Frame(k)
+        kb.grid(row=2, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        ttk.Button(kb, text="Show public key of an existing key…",
+                   command=self.show_existing_public).pack(side="left", padx=(0, 8))
+        ttk.Button(kb, text="Create key pair", style="Accent.TButton",
+                   command=self.keygen).pack(side="left")
         self.pub = tk.StringVar()
         self.pub_row = ttk.Frame(k)
         ttk.Entry(self.pub_row, textvariable=self.pub, state="readonly").pack(side="left", fill="x", expand=True)
@@ -1181,6 +1364,21 @@ class ToolsTab(ScrollFrame):
         )).pack(fill="x")
         ttk.Button(st, text="Forget my settings and recent files",
                    command=self.reset_settings).pack(anchor="e", pady=(8, 0))
+        ttk.Separator(st).pack(fill="x", pady=(GAP, 8))
+        self.check_updates = tk.BooleanVar(value=bool(app.settings.get("check_updates")))
+        ttk.Checkbutton(st, variable=self.check_updates, command=self._save_update_choice,
+                        text="Check for a new version when Crunchlock starts").pack(anchor="w")
+        ttk.Label(st, style="Muted.TLabel", justify="left", wraplength=640, text=(
+            "Off by default. Only asks github.com for the latest version number; nothing about "
+            "you or your files is sent, and nothing is downloaded automatically.")).pack(
+            fill="x", pady=(2, 0))
+        ur = ttk.Frame(st)
+        ur.pack(fill="x", pady=(8, 0))
+        self.update_label = ttk.Label(ur, text=f"You have version {__version__}.",
+                                      style="Card.TLabel")
+        self.update_label.pack(side="left")
+        ttk.Button(ur, text="Check now", command=lambda: app.check_for_update(manual=True)).pack(
+            side="right")
 
         n = card(b, "How your files are protected")
         ttk.Label(n, style="Card.TLabel", justify="left", wraplength=640, text=(
@@ -1191,6 +1389,43 @@ class ToolsTab(ScrollFrame):
             "the data cannot be recovered."
         )).pack(fill="x")
         self.gen()
+
+    def _save_update_choice(self):
+        self.app.settings.set("check_updates", bool(self.check_updates.get()))
+        self.app.settings.save()
+        if self.check_updates.get():
+            self.app.check_for_update()
+
+    def show_existing_public(self):
+        p = filedialog.askopenfilename(title="Your private key", parent=self, filetypes=[
+            ("Crunchlock private key", "*.clkkey"), ("All files", "*")])
+        if not p:
+            return
+        pw = simpledialog.askstring("Key passphrase", f"Passphrase for {Path(p).name}:",
+                                    show="•", parent=self)
+        if pw is None:
+            return
+        try:
+            ident = api.load_identity(p, pw)
+        except (CrunchlockError, OSError) as e:
+            messagebox.showerror("Can't open key", str(e), parent=self)
+            return
+        text = keys.public_key_to_text(ident)
+        pubf = Path(p).with_suffix(".clkpub")
+        try:
+            if not pubf.exists() or messagebox.askyesno(
+                    "Update public key file?", f"Save this public key (it now includes your "
+                    f"signature-check key) as {pubf.name}?", parent=self):
+                pubf.write_text(text + "\n")
+        except OSError:
+            pass
+        self.pub.set(text)
+        self.pub_row.grid(row=3, column=0, columnspan=3, sticky="we", pady=(10, 0))
+        messagebox.showinfo("Your public key",
+                            f"Fingerprint: {keys.fingerprint(ident.public)}\n"
+                            f"Signing fingerprint: {keys.fingerprint(ident.verify_key)}\n\n"
+                            "Share the public key (or the .clkpub file) with people who send "
+                            "you files or want to check your signatures.", parent=self)
 
     def reset_settings(self):
         if not messagebox.askyesno("Forget settings?",
@@ -1239,7 +1474,7 @@ class ToolsTab(ScrollFrame):
             fd = os.open(priv, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(data)
-            pubf.write_text(keys.public_key_to_text(ident.public) + "\n")
+            pubf.write_text(keys.public_key_to_text(ident) + "\n")
             return ident
 
         def done(ident, error):
@@ -1247,12 +1482,15 @@ class ToolsTab(ScrollFrame):
                 messagebox.showerror("Can't create key", str(error), parent=self)
                 return
             self.kpw.clear()
-            self.pub.set(keys.public_key_to_text(ident.public))
+            self.pub.set(keys.public_key_to_text(ident))
             self.pub_row.grid(row=3, column=0, columnspan=3, sticky="we", pady=(10, 0))
             messagebox.showinfo("Key pair created",
                                 f"Private key: {priv}\nKeep it secret and back it up.\n\n"
-                                f"Public key: {pubf}\nShare it with people who send you files.\n\n"
-                                f"Fingerprint: {keys.fingerprint(ident.public)}", parent=self)
+                                f"Public key: {pubf}\nShare it with people who send you files "
+                                "or want to check your signatures.\n\n"
+                                f"Fingerprint: {keys.fingerprint(ident.public)}\n"
+                                f"Signing fingerprint: {keys.fingerprint(ident.verify_key)}",
+                                parent=self)
 
         self.app.worker.on_done = done
         self.app.worker.start(job)
@@ -1282,11 +1520,13 @@ class App:
         header = ttk.Frame(root, padding=(GAP + 8, GAP + 2, GAP + 8, 4))
         header.pack(fill="x")
         ttk.Label(header, text="Crunchlock", style="AppTitle.TLabel").pack(side="left")
-        ttk.Label(header, text="Make files smaller and lock them with a password",
-                  style="Muted.TLabel").pack(side="left", padx=(12, 0), pady=(8, 0))
+        self._tagline = ttk.Label(header, text="Make files smaller and lock them with a password",
+                                  style="Muted.TLabel")
+        self._tagline.pack(side="left", padx=(12, 0), pady=(8, 0))
         self.mode_btn = ttk.Button(header, text="", command=self.toggle_theme, width=10)
         self.mode_btn.pack(side="right")
         ttk.Button(header, text="⌨  Shortcuts", command=self.show_shortcuts).pack(side="right", padx=(0, 8))
+        self.update_btn = ttk.Button(header, text="", style="Accent.TButton")  # shown when newer
         self._mode_text()
 
         nb = ttk.Notebook(root)
@@ -1314,10 +1554,52 @@ class App:
         self._watch_settings()
         self._bind_keys()
         root.protocol("WM_DELETE_WINDOW", self.close)
+        self._update_job = None
+        if self.settings.get("check_updates"):
+            self._update_job = root.after(1500, self.check_for_update)
+
+    # -- update check (opt-in)
+
+    def check_for_update(self, manual: bool = False):
+        results: queue.Queue = queue.Queue()
+        label = self.tools_tab.update_label
+        if manual:
+            label.configure(text="Checking…")
+
+        def work():
+            try:
+                results.put(update.check())
+            except Exception as e:  # noqa: BLE001 - offline, blocked, rate-limited…
+                results.put(e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            try:
+                res = results.get_nowait()
+            except queue.Empty:
+                self._update_job = self.root.after(250, poll)
+                return
+            self._update_job = None
+            if isinstance(res, Exception):
+                label.configure(text=f"You have version {__version__}. Couldn't check for "
+                                     "updates (are you offline?).")
+                return
+            if res.newer:
+                label.configure(text=f"Version {res.latest} is available (you have {res.current}).")
+                self.update_btn.configure(text=f"⬆  Get version {res.latest}",
+                                          command=lambda: webbrowser.open(res.url))
+                self._tagline.pack_forget()  # make room in the header
+                self.update_btn.pack(side="right", padx=(0, 8))
+            else:
+                label.configure(text=f"You have the latest version ({res.current}).")
+
+        self._update_job = self.root.after(250, poll)
 
     # -- remembered settings
 
-    _LOCK_OPTIONS = ("compress", "jpeg", "profile", "pad", "recovery", "split", "split_size", "each")
+    _LOCK_OPTIONS = ("compress", "jpeg", "long_range", "profile", "pad", "recovery", "split",
+                     "split_size", "each")
 
     def _geometry_fits(self, geo) -> bool:
         try:
@@ -1331,8 +1613,7 @@ class App:
         st, lt = self.settings, self.lock_tab
         for name in self._LOCK_OPTIONS:
             getattr(lt, name).set(st.get(name))
-        if not jpeg.AVAILABLE:
-            lt.jpeg.set(False)
+        self.tools_tab.check_updates.set(bool(st.get("check_updates")))
         idx = st.get("preset")
         lt.preset.set(PRESETS[idx][0] if 0 <= idx < len(PRESETS) else PRESETS[0][0])
         lt._sync()
@@ -1364,7 +1645,8 @@ class App:
         try:
             self.settings.set("geometry", self.root.geometry())
             self.settings.save()
-            for job in (getattr(self, "_poll_job", None), getattr(self, "_save_job", None)):
+            for job in (getattr(self, "_poll_job", None), getattr(self, "_save_job", None),
+                        getattr(self, "_update_job", None)):
                 if job:
                     self.root.after_cancel(job)
         finally:

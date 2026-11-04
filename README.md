@@ -7,12 +7,16 @@ key), and restores them byte-for-byte.
 - **Smaller files.** Optional lossless compression with zstd (level 19 by default) or xz, or
   `best` to try both and keep the smaller result. Text, logs, CSVs, source code and documents
   typically shrink by 75–95%. **JPEG photos are losslessly recompressed** (via JPEG XL) to about
-  15–22% smaller, and are restored byte-for-byte. Other data that is already compressed (videos,
-  zip files) is detected and stored as-is.
+  15–22% smaller, and **PNG images** (screenshots, diagrams) often 20–50% smaller. Both are
+  restored byte-for-byte. Big inputs get a bigger match window automatically, and `--long` finds
+  repeats up to 1 GiB apart (backups, disk images). Other data that is already compressed
+  (videos, zip files) is detected and stored as-is.
 - **Hard to crack.** AES-256-GCM authenticated encryption, with passwords hardened by
   **Argon2id** (256 MiB of RAM per guess by default, or 1 GiB with `--profile paranoid`).
   Any tampering, truncation or wrong password is detected. Nothing is ever silently corrupted.
 - **Private metadata.** File names, sizes and folder structure are all inside the encryption.
+- **Signed files.** Sign with your key so recipients can prove a file came from you and wasn't
+  changed.
 - **CLI and desktop app.** `crunchlock` on the command line, and `crunchlock-gui` for a simple
   window.
 
@@ -29,7 +33,11 @@ key), and restores them byte-for-byte.
 | Survive disk damage | `--recovery` (Reed-Solomon, +14%, repairs bursts up to 4 KB per 64 KB) |
 | Remove the originals | `--shred` (only after the new file is verified) |
 | Change the password / recipients | `crunchlock rekey file.clk` (no recompression needed) |
-| Keep photos untouched | `--no-jpeg` (turns off lossless JPEG recompression) |
+| Keep images untouched | `--no-jpeg`, `--no-png` (turn off lossless image recompression) |
+| Big backups / disk images | `--long` (finds repeats up to 1 GiB apart; unlocking needs up to 1 GiB RAM) |
+| Prove a file is from you | `lock --sign alice.clkkey`; the recipient runs `unlock --signer alice.clkpub` |
+| Add files to a locked file | `crunchlock add file.clk new.pdf more/` (no unpacking to disk) |
+| New version? | `crunchlock check-update`, or the opt-in check in the app |
 | See what's inside / take out one file | `crunchlock list file.clk`, then `unlock file.clk --only docs/report.pdf` |
 | Lock files one by one | `crunchlock lock *.pdf --each -o locked/` → one `.clk` per item |
 | Fix a damaged file | `crunchlock repair file.clk` → `file.repaired.clk` (needs `--recovery`; no password needed) |
@@ -117,13 +125,25 @@ crunchlock rekey taxes.clk -r bob.clkpub --no-password   # from now on only Bob'
 crunchlock verify taxes.clk --list
 crunchlock unlock taxes.clk -o ~/restored
 
+crunchlock add taxes.clk receipt.pdf          # add files (asks for the password)
+crunchlock add taxes.clk docs/ --replace      # replace the docs/ folder inside
+
 crunchlock genpass                            # e.g. cartoon-expenses-babble-disdain-eardrum-accurate
 
 # Public-key sharing: Bob makes a key pair and sends you bob.clkpub
 crunchlock keygen bob                         # (Bob) -> bob.clkkey (secret) + bob.clkpub (share)
 crunchlock lock report.pdf -r bob.clkpub      # (you)
 crunchlock unlock report.pdf.clk -i bob.clkkey  # (Bob)
+
+# Signatures: Alice signs; Bob only accepts the file if Alice's key signed it
+crunchlock lock report.pdf --sign alice.clkkey
+crunchlock unlock report.pdf.clk --signer alice.clkpub
+crunchlock pubkey alice.clkkey -o alice.clkpub  # re-export an older key's public key
 ```
+
+Public keys made by version 1.0.4 and later start with `clkpub2:` and include the key used to
+check signatures. Older `clkpub1:` keys still work for locking, but can't check signatures; run
+`crunchlock pubkey` on the private key to get the new form (the private key doesn't change).
 
 Passwords are never accepted as command-line arguments, because those leak into shell history
 and process lists. For scripts you can set `CRUNCHLOCK_PASSWORD`, but it's less safe.
@@ -144,7 +164,9 @@ removes any partial output.
 It **remembers your choices** (compression preset, theme, recovery data, padding, split
 size, folders and window size) and keeps a **Recent** list of locked files on the Unlock tab.
 Passwords, keyfiles and keys are never saved, and *Passphrases & keys → Forget my settings*
-clears it all. Settings live in `%APPDATA%\Crunchlock` (Windows), `~/Library/Application
+clears it all. On the same tab you can turn on **Check for a new version when Crunchlock
+starts** (off by default); when a newer release exists, a *Get version …* button appears in the
+header. Settings live in `%APPDATA%\Crunchlock` (Windows), `~/Library/Application
 Support/Crunchlock` (macOS) or `~/.config/crunchlock` (Linux).
 
 **Keyboard:** the app can be used without a mouse. Press **F1** (or click *Shortcuts*) for the
@@ -159,13 +181,13 @@ screen-reader use isn't guaranteed.
 
 The window has three tabs:
 - **Lock:** add files/folders, choose a compression preset (or switch compression off), and
-  optionally shrink JPEG photos losslessly. Set a password (with a strength meter and
-  *Generate* button). Under *Advanced options*: keyfile, recipients, padding, recovery data,
-  splitting and secure delete.
+  optionally shrink JPEG/PNG images losslessly or find far-apart repeats in big files. Set a
+  password (with a strength meter and *Generate* button). Under *Advanced options*: keyfile,
+  recipients, **signature**, padding, recovery data, splitting and secure delete.
 - **Unlock:** pick a `.clk` (or `.clk.001`), then *Check only* or *Unlock*. Click **Browse
   contents…** to see what's inside and extract only the files you pick. **Change the
-  password or who can open the file**, or **repair a damaged file**, in the sections of
-  those names.
+  password or who can open the file**, **add files to this locked file**, **check who
+  signed it**, or **repair a damaged file**, in the sections of those names.
 - Under *Advanced options* on the Lock tab, **Lock each item into its own .clk file** turns a
   list of files into separate locked files instead of one bundle.
 - **Passphrases & keys:** a passphrase generator (copied passphrases are cleared from the
@@ -190,7 +212,13 @@ files ─ tar ─▶ zstd/xz (optional) ─▶ AES-256-GCM in 1 MiB chunks ─�
 - **Public keys:** X25519 with an ephemeral key per file, HKDF-SHA256, and an AES-GCM-wrapped
   file key. The file doesn't say who the recipients are. Private keys are stored encrypted
   with your passphrase (Argon2id), with permissions `0600`.
-- **Nothing leaves your machine.** No network access, no telemetry, no cloud.
+- **Signatures:** Ed25519 over a SHA-512 hash of the file's plaintext stream, stored encrypted at
+  the end of the last chunk (so only people who can open the file see who signed it). The
+  signing key is derived from your private key with HKDF, so existing key files can sign. A
+  signature survives `rekey` (it covers the contents, not the keys); adding files removes it
+  unless you sign again. With `--signer`, nothing is extracted unless the signature checks out.
+- **Nothing leaves your machine.** No telemetry, no cloud. The only network access is the
+  opt-in update check, which asks GitHub for the latest version number and nothing else.
 - **Safe extraction.** Files are extracted into a hidden staging folder, and only moved into
   place after the *entire* file has been authenticated. Path traversal (`../`), absolute paths,
   escaping symlinks and device files are rejected (Python's tarfile `data` filter). Existing
@@ -202,6 +230,16 @@ files ─ tar ─▶ zstd/xz (optional) ─▶ AES-256-GCM in 1 MiB chunks ─�
 - **JPEG recompression** is checked file by file: each photo is converted, decoded straight
   back, and compared byte-for-byte with the original. Anything that doesn't match exactly (for
   example CMYK JPEGs) is stored unchanged.
+- **PNG repacking** keeps a PNG's pixel data uncompressed (zstd/xz then pack it much better
+  than the PNG's own deflate) plus the zlib settings that rebuild the original stream exactly.
+  Each PNG is rebuilt and compared byte-for-byte before it's stored that way, and a CRC-32 is
+  checked on unlock. It needs the standard zlib library: Python builds that use a different
+  deflate (for example zlib-ng) switch the feature off, and every official download is checked
+  for this. PNGs made by other encoders are stored unchanged.
+- **Adding files** (`add`) decrypts the old file and streams it, plus the new items, straight
+  into a new file with a new key. Nothing is unpacked to disk, and the original is replaced
+  only after it has been fully authenticated. Public keys can't be read back from a file, so if
+  it's shared with other people's keys you must list them again (your own key is kept).
 - **Symlinks** inside a locked folder are preserved. A link that points *outside* the selection
   is stored as a copy of its target file, or skipped. Either way you get a warning, and
   `--shred` will then not delete the originals.
@@ -223,8 +261,10 @@ files ─ tar ─▶ zstd/xz (optional) ─▶ AES-256-GCM in 1 MiB chunks ─�
 ```
 "CRLK" | version u8 | flags u8 | chunk_size u32 | nonce_prefix 7B | slot_count u8 | slots…
   flags: 0x01 = may contain JPEGs stored as JPEG XL (tar PAX header CRUNCHLOCK.jxl=1,
-         original size in CRUNCHLOCK.size). Unknown flags are refused, so older versions
-         never mis-extract newer files.
+         original size in CRUNCHLOCK.size)
+         0x02 = may contain PNGs stored unpacked (CRUNCHLOCK.png=1, .size, .crc)
+         0x04 = signed: the last chunk ends with Ed25519 public key 32B ‖ signature 64B
+         Unknown flags are refused, so older versions never mis-extract newer files.
   password slot: 1 | t u32 | mem_kib u32 | par u8 | keyfile u8 | salt 16B | nonce 12B | wrapped_key 48B
   X25519 slot:   2 | ephemeral_pub 32B | nonce 12B | wrapped_key 48B
 chunks: AES-GCM( u32 data_len ‖ data ‖ zero padding ), 16-byte tag each, last one flagged in the nonce

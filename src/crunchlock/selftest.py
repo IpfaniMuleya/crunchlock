@@ -57,6 +57,14 @@ def _check_imports(report: list[str]) -> None:
     if bytes(jpeg.jpegxl_decode_jpeg(jpeg.jpegxl_encode_jpeg(_TINY_JPEG))) != _TINY_JPEG:
         raise RuntimeError("JPEG XL round trip is not exact")
     report.append("JPEG XL codec OK")
+    import zlib
+    from . import png
+    if not png.available():
+        raise RuntimeError(f"this build's zlib ({zlib.ZLIB_RUNTIME_VERSION}) is not standard "
+                           "zlib, so PNG recompression can't work")
+    import certifi  # for the optional update check in bundled builds
+    report.append(f"standard zlib {zlib.ZLIB_RUNTIME_VERSION} (PNG repacking OK), "
+                  f"certifi {certifi.__version__}")
 
 
 def _check_round_trip(report: list[str]) -> None:
@@ -67,15 +75,41 @@ def _check_round_trip(report: list[str]) -> None:
         src.mkdir()
         (src / "notes.txt").write_text("crunchlock self-test\n" * 2000)
         (src / "photo.jpg").write_bytes(_TINY_JPEG)
+        _write_png(src / "image.png")
+        from . import keys
+        me = keys.generate_identity()
         out = tmp / "t.clk"
-        api.lock([src], out, password="self-test-passphrase", kdf_profile="light",
-                 compression="best", recovery_data=True)
-        api.verify(out, password="self-test-passphrase")
-        api.unlock(out, tmp / "out", password="self-test-passphrase")
+        r = api.lock([src], out, password="self-test-passphrase", kdf_profile="light",
+                     compression="best", recovery_data=True, sign_with=me)
+        if r.png_files != 1:
+            raise RuntimeError("the test PNG was not repacked")
+        extra = tmp / "added.txt"
+        extra.write_text("added later\n")
+        api.add(out, [extra], password="self-test-passphrase", sign_with=me)
+        api.verify(out, password="self-test-passphrase", signer=me)
+        api.unlock(out, tmp / "out", password="self-test-passphrase", signer=me)
+        if (tmp / "out" / "added.txt").read_bytes() != extra.read_bytes():
+            raise RuntimeError("round trip changed added.txt")
         for f in src.iterdir():
             if (tmp / "out" / "data" / f.name).read_bytes() != f.read_bytes():
                 raise RuntimeError(f"round trip changed {f.name}")
-    report.append("lock -> verify -> unlock round trip OK")
+    report.append("lock (signed, PNG) -> add -> verify -> unlock round trip OK")
+
+
+def _write_png(path: Path) -> None:
+    """A small RGB PNG written the way libpng does (plain zlib, default settings)."""
+    import struct
+    import zlib
+
+    def chunk(t: bytes, d: bytes) -> bytes:
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+    w, h = 96, 64
+    rows = b"".join(b"\x01" + bytes(v for x in range(w)
+                                    for v in ((x * 5 + y) & 255, (y * 3) & 255, 128))
+                    for y in range(h))
+    data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+    path.write_bytes(data)
 
 
 def _check_gui(report: list[str]) -> None:
