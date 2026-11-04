@@ -26,6 +26,7 @@ except Exception:  # noqa: BLE001 - drag and drop is optional
     TkinterDnD = None
 
 from . import api, instance, jpeg, kdf, keys, passgen
+from .settings import Settings
 from .cli import human
 from .errors import CancelledError, CrunchlockError, WrongKeyError
 from .eta import Eta, format_eta
@@ -620,7 +621,7 @@ class LockTab(ScrollFrame):
             self.out_title.configure(text="Save to folder")
             self.out_hint.configure(text="Each item becomes <name>.clk. Leave empty to save each "
                                          "one next to the original.")
-            self.output.set("")
+            self.output.set(self.app.settings.get("save_dir") if hasattr(self.app, "settings") else "")
         else:
             self.out_title.configure(text="Save as")
             self.out_hint.configure(text="")
@@ -628,9 +629,12 @@ class LockTab(ScrollFrame):
 
     def browse_output(self):
         if self.each.get():
-            p = filedialog.askdirectory(title="Save the locked files in")
+            p = filedialog.askdirectory(title="Save the locked files in",
+                                        initialdir=self.output.get() or None)
             if p:
                 self.output.set(p)
+                self.app.settings.set("save_dir", p)
+                self.app.settings.save()
             return
         p = filedialog.asksaveasfilename(title="Save locked file as", defaultextension=".clk",
                                          filetypes=[("Crunchlock file", "*.clk")])
@@ -714,6 +718,10 @@ class LockTab(ScrollFrame):
             self.after(50, self.scroll_to_end)
             return
         self.pwbox.clear()
+        outs = [r.outputs[0] for r in result] if isinstance(result, list) else [result.outputs[0]]
+        for o in outs:
+            self.app.settings.add_recent(o)
+        self.app.settings.save()
         if isinstance(result, list):
             self._done_each(result)
             return
@@ -835,14 +843,17 @@ class UnlockTab(ScrollFrame):
         self.app = app
         b = self.body
         f = card(b, "Locked file")
+        self.recent_btn = ttk.Menubutton(f.header, text="Recent")
+        self.recent_menu = tk.Menu(self.recent_btn, tearoff=False, postcommand=self._fill_recent)
+        self.recent_btn["menu"] = self.recent_menu
+        self.recent_btn.pack(side="right")
         self.file = tk.StringVar()
         labeled_entry(f, 0, "File", self.file, self.browse)
         self.info = ttk.Label(f, text="Choose a .clk file (or the .001 part of a split file).",
                               style="Muted.TLabel")
         self.info.grid(row=1, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(0, 4))
         self.dest = tk.StringVar()
-        labeled_entry(f, 2, "Extract to", self.dest,
-                      lambda: self.dest.set(filedialog.askdirectory(title="Extract into") or self.dest.get()))
+        labeled_entry(f, 2, "Extract to", self.dest, self.browse_dest)
         self.force = tk.BooleanVar()
         ttk.Checkbutton(f, text="Replace existing files with the same name", variable=self.force).grid(
             row=3, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(4, 0))
@@ -970,9 +981,41 @@ class UnlockTab(ScrollFrame):
             return
         for box in (self.pwbox, self.idpw, self.newpw):
             box.clear()
+        self.remember(self.file.get())
         self.show_info()
         self.status.show(f"✓  Access updated. {Path(self.file.get()).name} now opens with: "
                          f"{result.unlock_with}", "ok")
+
+    def _fill_recent(self):
+        m = self.recent_menu
+        m.delete(0, "end")
+        recent = self.app.settings.recent()
+        if not recent:
+            m.add_command(label="No recent files yet", state="disabled")
+            return
+        for i, path in enumerate(recent, 1):
+            p = Path(path)
+            m.add_command(label=f"{i}  {p.name}   —   {p.parent}", underline=0,
+                          command=lambda path=path: self.app.open_paths([path]))
+        m.add_separator()
+        m.add_command(label="Clear recent files", command=self._clear_recent)
+
+    def _clear_recent(self):
+        self.app.settings.clear_recent()
+        self.app.settings.save()
+
+    def remember(self, path):
+        if path:
+            self.app.settings.add_recent(path)
+            self.app.settings.save()
+
+    def browse_dest(self):
+        p = filedialog.askdirectory(title="Extract into",
+                                    initialdir=self.dest.get() or self.app.settings.get("extract_dir") or None)
+        if p:
+            self.dest.set(p)
+            self.app.settings.set("extract_dir", p)
+            self.app.settings.save()
 
     def browse(self):
         p = filedialog.askopenfilename(title="Choose a locked file",
@@ -1038,6 +1081,7 @@ class UnlockTab(ScrollFrame):
                 "\nEnter the password and click Check only on the repaired copy to confirm it.")
         first = r.outputs[0]
         self.file.set(str(first))
+        self.remember(first)
         self.status.show(msg, "ok", ("Show in folder", lambda: open_in_file_manager(first)))
 
     def run(self, verify=False, browse=False, only=None):
@@ -1076,6 +1120,7 @@ class UnlockTab(ScrollFrame):
             prefix = "Wrong password or key" if isinstance(error, WrongKeyError) else "Failed"
             self.status.show(f"{prefix}: {error}", "error")
             return
+        self.remember(self.file.get())
         if browse:
             self.status.show("Opened. Pick what to extract in the window.", "ok")
             ContentsDialog(self, result.entries)
@@ -1129,6 +1174,14 @@ class ToolsTab(ScrollFrame):
         ttk.Button(self.pub_row, text="Copy public key",
                    command=lambda: self.clipboard_put(self.pub.get())).pack(side="left", padx=(8, 0))
 
+        st = card(b, "App settings", "your choices are remembered between sessions")
+        ttk.Label(st, style="Card.TLabel", justify="left", wraplength=640, text=(
+            "Crunchlock remembers options like compression, theme, recovery data and folders, "
+            "plus a list of recent locked files. Passwords, keyfiles and keys are never saved."
+        )).pack(fill="x")
+        ttk.Button(st, text="Forget my settings and recent files",
+                   command=self.reset_settings).pack(anchor="e", pady=(8, 0))
+
         n = card(b, "How your files are protected")
         ttk.Label(n, style="Card.TLabel", justify="left", wraplength=640, text=(
             "•  AES-256-GCM encryption; any change to a locked file is detected.\n"
@@ -1138,6 +1191,15 @@ class ToolsTab(ScrollFrame):
             "the data cannot be recovered."
         )).pack(fill="x")
         self.gen()
+
+    def reset_settings(self):
+        if not messagebox.askyesno("Forget settings?",
+                                   "Reset all options to their defaults and clear the recent "
+                                   "files list?", parent=self):
+            return
+        self.app.settings.reset()
+        self.app.apply_settings()
+        messagebox.showinfo("Done", "Settings reset and recent files cleared.", parent=self)
 
     def clipboard_put(self, text):
         self.clipboard_clear()
@@ -1199,8 +1261,9 @@ class ToolsTab(ScrollFrame):
 # ---------------------------------------------------------------------- app
 
 class App:
-    def __init__(self, root, dark: bool | None = None):
+    def __init__(self, root, dark: bool | None = None, settings: Settings | None = None):
         self.root = root
+        self.settings = settings if settings is not None else Settings()
         self.themed: list = []
         self.colors: dict = {}
         root.title("Crunchlock")
@@ -1209,7 +1272,10 @@ class App:
             root.iconphoto(True, self._icon)
         except tk.TclError:
             pass
-        self.dark = windows_prefers_dark() if dark is None else dark
+        saved_theme = self.settings.get("theme")
+        if dark is None:
+            dark = (saved_theme == "dark") if saved_theme else windows_prefers_dark()
+        self.dark = dark
         self._apply_theme()
         self.worker = Worker(root)
 
@@ -1220,6 +1286,7 @@ class App:
                   style="Muted.TLabel").pack(side="left", padx=(12, 0), pady=(8, 0))
         self.mode_btn = ttk.Button(header, text="", command=self.toggle_theme, width=10)
         self.mode_btn.pack(side="right")
+        ttk.Button(header, text="⌨  Shortcuts", command=self.show_shortcuts).pack(side="right", padx=(0, 8))
         self._mode_text()
 
         nb = ttk.Notebook(root)
@@ -1227,20 +1294,161 @@ class App:
         self.lock_tab = LockTab(nb, self)
         self.unlock_tab = UnlockTab(nb, self)
         self.tools_tab = ToolsTab(nb, self)
-        nb.add(self.lock_tab, text="  Lock  ")
-        nb.add(self.unlock_tab, text="  Unlock  ")
-        nb.add(self.tools_tab, text="  Passphrases & keys  ")
+        nb.add(self.lock_tab, text="  Lock  ", underline=2)
+        nb.add(self.unlock_tab, text="  Unlock  ", underline=2)
+        nb.add(self.tools_tab, text="  Passphrases & keys  ", underline=2)
+        nb.enable_traversal()  # Ctrl+Tab / Ctrl+Shift+Tab, Alt+L / Alt+U / Alt+P
         self.notebook = nb
         self.themed += [self.lock_tab, self.unlock_tab, self.tools_tab]
         self._recolor()
         self.incoming: queue.Queue = queue.Queue()
         self._enable_drop(root)
-        root.after(200, self._poll_incoming)
+        self._poll_job = root.after(200, self._poll_incoming)
 
         w = min(860, int(root.winfo_screenwidth() * 0.9))
         h = min(900, int(root.winfo_screenheight() * 0.88))
-        root.geometry(f"{w}x{h}")
+        geo = self.settings.get("geometry")
+        root.geometry(geo if self._geometry_fits(geo) else f"{w}x{h}")
         root.minsize(640, 480)
+        self.apply_settings()
+        self._watch_settings()
+        self._bind_keys()
+        root.protocol("WM_DELETE_WINDOW", self.close)
+
+    # -- remembered settings
+
+    _LOCK_OPTIONS = ("compress", "jpeg", "profile", "pad", "recovery", "split", "split_size", "each")
+
+    def _geometry_fits(self, geo) -> bool:
+        try:
+            size = geo.split("+")[0]
+            w, h = (int(v) for v in size.split("x"))
+        except (AttributeError, ValueError):
+            return False
+        return 640 <= w <= self.root.winfo_screenwidth() and 480 <= h <= self.root.winfo_screenheight()
+
+    def apply_settings(self):
+        st, lt = self.settings, self.lock_tab
+        for name in self._LOCK_OPTIONS:
+            getattr(lt, name).set(st.get(name))
+        if not jpeg.AVAILABLE:
+            lt.jpeg.set(False)
+        idx = st.get("preset")
+        lt.preset.set(PRESETS[idx][0] if 0 <= idx < len(PRESETS) else PRESETS[0][0])
+        lt._sync()
+        lt._sync_output()
+        theme = st.get("theme")
+        if theme and (theme == "dark") != self.dark:
+            self.toggle_theme(save=False)
+
+    def _watch_settings(self):
+        lt = self.lock_tab
+        self._save_job = None
+
+        def changed(*_):
+            st = self.settings
+            for name in self._LOCK_OPTIONS:
+                try:
+                    st.set(name, getattr(lt, name).get())
+                except tk.TclError:
+                    pass
+            st.set("preset", next((i for i, p in enumerate(PRESETS) if p[0] == lt.preset.get()), 0))
+            if self._save_job:
+                self.root.after_cancel(self._save_job)
+            self._save_job = self.root.after(400, st.save)
+
+        for name in self._LOCK_OPTIONS + ("preset",):
+            getattr(lt, name).trace_add("write", changed)
+
+    def close(self):
+        try:
+            self.settings.set("geometry", self.root.geometry())
+            self.settings.save()
+            for job in (getattr(self, "_poll_job", None), getattr(self, "_save_job", None)):
+                if job:
+                    self.root.after_cancel(job)
+        finally:
+            self.root.destroy()
+
+    # -- keyboard
+
+    def _current_tab(self):
+        return self.root.nametowidget(self.notebook.select())
+
+    def _primary_action(self, event=None):
+        if self.worker.busy:
+            return "break"
+        tab = self._current_tab()
+        if event is not None and event.keysym == "Return" and not (event.state & 0x4):
+            focus = self.root.focus_get()
+            # Plain Enter acts only from text fields / checkboxes, so it never
+            # fights a focused button, list or the contents window.
+            if focus is None or focus.winfo_toplevel() is not self.root or \
+                    focus.winfo_class() not in ("TEntry", "Entry", "TCheckbutton", "TCombobox", "TSpinbox"):
+                return None
+        if tab is self.lock_tab:
+            self.lock_tab.run()
+        elif tab is self.unlock_tab:
+            self.unlock_tab.run()
+        return "break"
+
+    def _open_shortcut(self, folder=False):
+        tab = self._current_tab()
+        if tab is self.unlock_tab:
+            self.unlock_tab.browse()
+        else:
+            self.notebook.select(self.lock_tab)
+            self.lock_tab.add_folder() if folder else self.lock_tab.add_files()
+        return "break"
+
+    def _escape(self, _event=None):
+        if self.worker.busy:
+            self.worker.cancel()
+            return "break"
+        return None
+
+    def _bind_keys(self):
+        r = self.root
+        r.bind("<Return>", self._primary_action)
+        r.bind("<KP_Enter>", self._primary_action)
+        r.bind("<Control-Return>", self._primary_action)
+        r.bind("<Escape>", self._escape)
+        r.bind("<Control-o>", lambda e: self._open_shortcut())
+        r.bind("<Control-O>", lambda e: self._open_shortcut(folder=True))  # Ctrl+Shift+O
+        r.bind("<F1>", lambda e: self.show_shortcuts())
+        for i, tab in enumerate((self.lock_tab, self.unlock_tab, self.tools_tab), 1):
+            r.bind(f"<Control-Key-{i}>", lambda e, t=tab: (self.notebook.select(t), "break")[1])
+
+    SHORTCUTS = [
+        ("Enter", "Lock / Unlock (from a password or text field)"),
+        ("Ctrl+Enter", "Lock / Unlock from anywhere on the tab"),
+        ("Esc", "Cancel the running operation"),
+        ("Ctrl+O", "Add files (Lock tab) or open a locked file (Unlock tab)"),
+        ("Ctrl+Shift+O", "Add a folder to lock"),
+        ("Ctrl+1 / 2 / 3", "Go to Lock / Unlock / Passphrases & keys"),
+        ("Ctrl+Tab", "Next tab (Ctrl+Shift+Tab: previous)"),
+        ("Tab / Shift+Tab", "Move between fields and buttons"),
+        ("Space", "Press the focused button or tick the focused checkbox"),
+        ("F1", "Show this list"),
+    ]
+
+    def show_shortcuts(self):
+        win = tk.Toplevel(self.root)
+        win.title("Keyboard shortcuts")
+        win.transient(self.root)
+        win.configure(background=self.colors["bg"])
+        body = ttk.Frame(win, padding=GAP + 4)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Keyboard shortcuts", style="CardTitle.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        for i, (keys_, what) in enumerate(self.SHORTCUTS, 1):
+            ttk.Label(body, text=keys_, font=("TkFixedFont", 10, "bold")).grid(row=i, column=0, sticky="w", padx=(0, 16), pady=2)
+            ttk.Label(body, text=what).grid(row=i, column=1, sticky="w", pady=2)
+        close = ttk.Button(body, text="Close", command=win.destroy)
+        close.grid(row=len(self.SHORTCUTS) + 1, column=1, sticky="e", pady=(GAP, 0))
+        win.bind("<Escape>", lambda e: win.destroy())
+        close.focus_set()
+        return win
 
     # -- files arriving from drag and drop, the command line or other launches
 
@@ -1253,9 +1461,12 @@ class App:
             if not self.unlock_tab.dest.get():
                 self.unlock_tab.dest.set(str(Path(locked[0]).parent))
             self.notebook.select(self.unlock_tab)
+            self.root.after(50, self.unlock_tab.pwbox.e1.focus_set)
         elif paths:
             self.lock_tab._add(paths)
             self.notebook.select(self.lock_tab)
+            if not self.lock_tab.pwbox.pw.get():
+                self.root.after(50, self.lock_tab.pwbox.e1.focus_set)
 
     def bring_to_front(self):
         r = self.root
@@ -1273,7 +1484,7 @@ class App:
                 self.open_paths(paths)
         except queue.Empty:
             pass
-        self.root.after(200, self._poll_incoming)
+        self._poll_job = self.root.after(200, self._poll_incoming)
 
     def _enable_drop(self, root):
         if TkinterDnD is None or not hasattr(root, "drop_target_register"):
@@ -1331,11 +1542,14 @@ class App:
     def _mode_text(self):
         self.mode_btn.configure(text="☀  Light" if self.dark else "☾  Dark")
 
-    def toggle_theme(self):
+    def toggle_theme(self, save: bool = True):
         self.dark = not self.dark
         self._apply_theme()
         self._mode_text()
         self._recolor()
+        if save:
+            self.settings.set("theme", "dark" if self.dark else "light")
+            self.settings.save()
 
 
 def main(argv=None) -> int:

@@ -141,6 +141,22 @@ It follows your system's light or dark mode, and you can switch with the button 
 it. Long operations show a progress bar with the **time left** and a **Cancel** button; cancelling
 removes any partial output.
 
+It **remembers your choices** (compression preset, theme, recovery data, padding, split
+size, folders and window size) and keeps a **Recent** list of locked files on the Unlock tab.
+Passwords, keyfiles and keys are never saved, and *Passphrases & keys → Forget my settings*
+clears it all. Settings live in `%APPDATA%\Crunchlock` (Windows), `~/Library/Application
+Support/Crunchlock` (macOS) or `~/.config/crunchlock` (Linux).
+
+**Keyboard:** the app can be used without a mouse. Press **F1** (or click *Shortcuts*) for the
+list:
+- Enter locks or unlocks from a password field; Ctrl+Enter does it from anywhere on the tab.
+- Esc cancels the running job.
+- Ctrl+O opens files; Ctrl+Shift+O adds a folder.
+- Ctrl+1/2/3 or Alt+L/U/P switch tabs, and Tab moves between fields.
+
+Tk's screen-reader support is limited, so labels and status messages are plain text, but full
+screen-reader use isn't guaranteed.
+
 The window has three tabs:
 - **Lock:** add files/folders, choose a compression preset (or switch compression off), and
   optionally shrink JPEG photos losslessly. Set a password (with a strength meter and
