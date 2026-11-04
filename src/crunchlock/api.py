@@ -10,8 +10,10 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 
 from . import archive, compress, kdf, keys, recovery
 from .crypto import DecryptReader, EncryptWriter
-from .errors import CorruptFileError, CrunchlockError, WrongKeyError  # noqa: F401 (re-export)
-from .format import Header, PasswordSlot, read_header
+from . import jpeg as jpeg_codec
+from .crypto import reencrypt
+from .errors import CancelledError, CorruptFileError, CrunchlockError, WrongKeyError  # noqa: F401 (re-export)
+from .format import FLAG_JPEG_XL, Header, PasswordSlot, read_header
 from .shred import shred
 from .split import MultiReader, OutputSink, resolve_parts
 
@@ -32,6 +34,8 @@ class LockResult:
     compression_note: str = ""
     shredded: list[Path] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    jpeg_files: int = 0
+    jpeg_saved: int = 0
 
     @property
     def saved_percent(self) -> float:
@@ -115,9 +119,9 @@ class _Pipeline:
     """tar bytes -> compress -> encrypt (+pad) -> [Reed-Solomon] -> file(s)."""
 
     def __init__(self, out: Path, algo: int, level: int | None, *, password, keyfile, recipients,
-                 params, pad, recovery_data, split_size, force):
+                 params, pad, recovery_data, split_size, force, flags=0):
         self.file_key = keys.new_file_key()
-        header = Header(chunk_size=CHUNK_SIZE, nonce_prefix=os.urandom(7))
+        header = Header(chunk_size=CHUNK_SIZE, nonce_prefix=os.urandom(7), flags=flags)
         prefix = header.prefix()
         if password or keyfile is not None:
             header.slots.append(keys.make_password_slot(prefix, self.file_key, password, keyfile, params))
@@ -149,11 +153,15 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
          recipients: Iterable[X25519PublicKey] = (), compression: str = "zstd",
          level: int | None = None, kdf_profile: str | kdf.KdfParams = "standard",
          pad: bool = False, recovery_data: bool = False, split_size: int | None = None,
-         shred_originals: bool = False, force: bool = False,
+         shred_originals: bool = False, force: bool = False, jpeg: bool = True,
          progress: Progress = None) -> LockResult:
     """Compress (optionally) and encrypt *paths* into one ``.clk`` file (or parts).
 
     compression: "zstd" (default), "xz", "best" (tries both, keeps the smaller) or "none".
+    jpeg: losslessly recompress JPEG photos (~20% smaller, exact bytes restored);
+    only applies when compression is on.
+
+    *progress* may raise CancelledError to abort; partial output is removed.
     """
     paths = archive.check_inputs([Path(p) for p in paths])
     recipients = list(recipients)
@@ -183,10 +191,12 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
         else:
             algos = [compress.BY_NAME[mode]]
 
+    use_jpeg = jpeg and mode != "none" and jpeg_codec.AVAILABLE
     if progress:
         progress("deriving key", 0, 1)
     common = dict(password=password, keyfile=keyfile, recipients=recipients, params=params,
-                  pad=pad, recovery_data=recovery_data, split_size=split_size, force=force)
+                  pad=pad, recovery_data=recovery_data, split_size=split_size, force=force,
+                  flags=FLAG_JPEG_XL if use_jpeg else 0)
     pipes: list[_Pipeline] = []
     try:
         if len(algos) == 1:
@@ -204,7 +214,9 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
             if progress:
                 progress("locking", done[0], total)
 
-        warnings = archive.pack(paths, pipes[0] if len(pipes) == 1 else _Tee(pipes), cb)
+        stats = archive.PackStats()
+        warnings = archive.pack(paths, pipes[0] if len(pipes) == 1 else _Tee(pipes), cb,
+                                jpeg_recompress=use_jpeg, stats=stats)
         for pipe in pipes:
             pipe.finish()
         best = min(pipes, key=lambda pp: pp.sink.total)
@@ -221,12 +233,16 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
         note = "best of " + ", ".join(f"{k} {v / 1048576:.2f} MB" for k, v in sizes.items()) \
             + f" -> kept {compress.NAMES[best.algo]}"
 
+    if stats.jpeg_files:
+        photo_note = (f"{stats.jpeg_files} JPEG photo(s) recompressed losslessly, "
+                      f"saving {stats.jpeg_saved / 1048576:.1f} MB")
+        note = photo_note if not note or note.startswith("data looks") else f"{note}; {photo_note}"
     result = LockResult(outputs, total, best.sink.total, compress.NAMES[best.algo], note,
-                        warnings=warnings)
+                        warnings=warnings, jpeg_files=stats.jpeg_files, jpeg_saved=stats.jpeg_saved)
     if shred_originals:
         # Only destroy the originals after proving the new file opens correctly.
-        if progress:
-            progress("verifying", 0, 1)
+        # The output is already committed, so cancelling is no longer possible.
+        _quiet(progress, "verifying", 0, 1)
         _open_and_verify(outputs, file_key=best.file_key)
         if warnings:
             result.warnings.append("originals NOT deleted because some links could not be "
@@ -238,29 +254,52 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
     return result
 
 
+def _quiet(progress: Progress, *args) -> None:
+    """Report progress where cancelling is no longer allowed."""
+    if progress:
+        try:
+            progress(*args)
+        except CancelledError:
+            pass
+
+
+def _identity_key(identity):
+    return identity.private if isinstance(identity, keys.Identity) else identity
+
+
+def _open_header(parts, password=None, keyfile=None, identity=None, file_key=None, progress=None):
+    """Open the file(s) and recover the file key. Returns (mr, stream, rs, header, raw, key)."""
+    mr = MultiReader(parts)
+    try:
+        stream, rs = recovery.open_layer(mr)
+        header, raw = read_header(stream)
+        if file_key is None:
+            if progress:
+                progress("deriving key", 0, 1)
+            file_key = keys.open_file_key(header, password, keyfile, _identity_key(identity))
+    except BaseException:
+        mr.close()
+        raise
+    return mr, stream, rs, header, raw, file_key
+
+
 def _open(path_or_parts, password=None, keyfile=None, identity=None, file_key=None, progress=None,
           stage="unlocking"):
     parts = path_or_parts if isinstance(path_or_parts, list) else resolve_parts(Path(path_or_parts))
-    mr = MultiReader(parts)
-    stream, rs = recovery.open_layer(mr)
-    try:
-        header, raw = read_header(stream)
-    except CorruptFileError:
-        mr.close()
-        raise
-    if file_key is None:
-        if progress:
-            progress("deriving key", 0, 1)
-        file_key = keys.open_file_key(header, password, keyfile,
-                                      identity.private if isinstance(identity, keys.Identity) else identity)
+    mr, stream, rs, header, raw, file_key = _open_header(parts, password, keyfile, identity,
+                                                         file_key, progress)
     total = mr.total
 
     def cb(n):
         if progress:
             progress(stage, min(n, total), total)
 
-    dec = DecryptReader(stream, raw, file_key, header.chunk_size, header.nonce_prefix, cb)
-    decomp = compress.DecompressReader(dec)
+    try:
+        dec = DecryptReader(stream, raw, file_key, header.chunk_size, header.nonce_prefix, cb)
+        decomp = compress.DecompressReader(dec)
+    except BaseException:
+        mr.close()
+        raise
 
     def finish():
         if dec.read(1):
@@ -268,15 +307,17 @@ def _open(path_or_parts, password=None, keyfile=None, identity=None, file_key=No
         dec.read_all_and_discard()
         if not dec.finished:
             raise CorruptFileError("file is truncated")
-        mr.close()
 
-    return decomp, finish, rs
+    return decomp, finish, rs, mr
 
 
 def _open_and_verify(parts, **kw) -> VerifyResult:
-    decomp, finish, rs = _open(parts, **kw)
-    entries = archive.list_members(decomp)
-    finish()
+    decomp, finish, rs, mr = _open(parts, **kw)
+    try:
+        entries = archive.list_members(decomp)
+        finish()
+    finally:
+        mr.close()
     return VerifyResult(entries, compress.NAMES[decomp.algo], rs.corrected_bytes if rs else 0)
 
 
@@ -291,10 +332,73 @@ def unlock(path: str | Path, dest: str | Path | None = None, *, password=None, k
            identity=None, force: bool = False, progress: Progress = None) -> UnlockResult:
     path = Path(path)
     dest = Path(dest) if dest else path.resolve().parent
-    decomp, finish, rs = _open(path, password=password, keyfile=keyfile, identity=identity,
-                               progress=progress)
-    extracted = archive.extract(decomp, dest, force, before_commit=finish)
+    decomp, finish, rs, mr = _open(path, password=password, keyfile=keyfile, identity=identity,
+                                   progress=progress)
+    try:
+        extracted = archive.extract(decomp, dest, force, before_commit=finish)
+    finally:
+        mr.close()
     return UnlockResult(extracted, compress.NAMES[decomp.algo], rs.corrected_bytes if rs else 0)
+
+
+@dataclass
+class RekeyResult:
+    outputs: list[Path]
+    unlock_with: str
+
+
+def rekey(path: str | Path, *, password: str | None = None, keyfile: bytes | None = None,
+          identity=None, new_password: str | None = None, new_keyfile: bytes | None = None,
+          recipients: Iterable[X25519PublicKey] = (), kdf_profile: str | kdf.KdfParams = "standard",
+          progress: Progress = None) -> RekeyResult:
+    """Change who can open a locked file (password, keyfile and/or recipients).
+
+    Opens the file with the current secrets, then replaces *all* key slots with
+    the new set. The data is re-encrypted under a brand-new key, chunk by chunk,
+    without decompressing it (fast: limited by disk speed), and the file is
+    replaced only after every chunk has been authenticated. Padding, recovery
+    data and the split layout are kept.
+    """
+    recipients = list(recipients)
+    if not new_password and new_keyfile is None and not recipients:
+        raise CrunchlockError("the file needs at least one new password, keyfile or recipient")
+    params = kdf.PROFILES[kdf_profile] if isinstance(kdf_profile, str) else kdf_profile
+    parts = resolve_parts(Path(path))
+    split_size = parts[0].stat().st_size if len(parts) > 1 else None
+    base = parts[0].with_name(parts[0].name[:-4]) if len(parts) > 1 else parts[0]
+    mr, stream, rs, header, raw, old_key = _open_header(parts, password, keyfile, identity,
+                                                        progress=progress)
+    sink = None
+    try:
+        if progress:
+            progress("deriving key", 0, 1)
+        new_key = keys.new_file_key()
+        new_header = Header(chunk_size=header.chunk_size, nonce_prefix=os.urandom(7),
+                            flags=header.flags)
+        prefix = new_header.prefix()
+        if new_password or new_keyfile is not None:
+            new_header.slots.append(keys.make_password_slot(prefix, new_key, new_password,
+                                                            new_keyfile, params))
+        for r in recipients:
+            new_header.slots.append(keys.make_x25519_slot(prefix, new_key, r))
+        total = mr.total
+
+        def cb(n):
+            if progress:
+                progress("re-encrypting", min(n, total), total)
+
+        dec = DecryptReader(stream, raw, old_key, header.chunk_size, header.nonce_prefix, cb)
+        sink = OutputSink(base, split_size, force=True)
+        target = recovery.RSWriter(sink, rs.cols) if rs else sink
+        reencrypt(dec, target, new_header.pack(), new_key, new_header.nonce_prefix)
+    except BaseException:
+        mr.close()
+        if sink:
+            sink.abort()
+        raise
+    mr.close()  # release the old files before replacing them (required on Windows)
+    outputs = sink.commit()
+    return RekeyResult(outputs, keys.describe_slots(new_header))
 
 
 def info(path: str | Path) -> dict:
@@ -323,6 +427,7 @@ def info(path: str | Path) -> dict:
         "cipher": "AES-256-GCM (chunked)",
         "chunk_size": header.chunk_size,
         "recovery_data": rs is not None,
+        "jpeg_recompression": bool(header.flags & FLAG_JPEG_XL),
         "key_slots": slots,
         "needs_keyfile": keys.needs_keyfile(header),
     }

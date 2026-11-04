@@ -20,6 +20,9 @@ COMMON = [
     "--paths", str(ROOT / "src"),
     "--collect-data", "crunchlock",   # bundles the passphrase wordlist
     "--collect-data", "sv_ttk",       # the Windows 11 style theme
+    "--hidden-import", "imagecodecs._jpegxl",  # lossless JPEG recompression
+    "--hidden-import", "imagecodecs._shared",
+    "--hidden-import", "imagecodecs._shared_cython",
     "--distpath", str(ROOT / "dist"),
     "--workpath", str(ROOT / "build"),
     "--specpath", str(ROOT / "build"),
@@ -32,9 +35,23 @@ def run(*args: str) -> None:
     subprocess.run(cmd, check=True)
 
 
+def icon_args() -> list[str]:
+    """Generate the app icon (needs Pillow); skipped quietly if Pillow is missing."""
+    try:
+        sys.path.insert(0, str(ROOT / "packaging"))
+        import make_icon
+    except ImportError:
+        print("Pillow not installed: building without a custom icon")
+        return []
+    make_icon.main(str(ROOT / "build" / "icons"))
+    ico = ROOT / "build" / "icons" / ("crunchlock.ico" if sys.platform != "darwin" else "crunchlock.png")
+    return ["--icon", str(ico)]
+
+
 def main() -> None:
-    run("--name", "crunchlock", "--console", str(ROOT / "packaging" / "crunchlock_cli.py"))
-    run("--name", "CrunchlockGUI", "--windowed", str(ROOT / "packaging" / "crunchlock_gui.py"))
+    icon = icon_args()
+    run("--name", "crunchlock", "--console", *icon, str(ROOT / "packaging" / "crunchlock_cli.py"))
+    run("--name", "CrunchlockGUI", "--windowed", *icon, str(ROOT / "packaging" / "crunchlock_gui.py"))
     print("\nBuilt:")
     for p in sorted((ROOT / "dist").iterdir()):
         print(f"  {p}  ({p.stat().st_size / 1e6:.1f} MB)")

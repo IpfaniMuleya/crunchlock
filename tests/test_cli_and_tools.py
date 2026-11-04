@@ -61,7 +61,8 @@ def test_cli_recipients(tmp_path, sample, monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     base = tmp_path / "alice"
     assert cli.main(["keygen", str(base)]) == 0
-    assert oct(os.stat(base.with_suffix(".clkkey")).st_mode & 0o777) == "0o600"
+    if os.name == "posix":
+        assert oct(os.stat(base.with_suffix(".clkkey")).st_mode & 0o777) == "0o600"
     out = tmp_path / "r.clk"
     assert cli.main(["lock", str(sample), "-o", str(out), "-r", str(base.with_suffix(".clkpub")),
                      "--split", "300K", "--recovery", "--pad", "-q"]) == 0

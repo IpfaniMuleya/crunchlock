@@ -6,8 +6,9 @@ key), and restores them byte-for-byte.
 
 - **Smaller files.** Optional lossless compression with zstd (level 19 by default) or xz, or
   `best` to try both and keep the smaller result. Text, logs, CSVs, source code and documents
-  typically shrink by 75–95%. Data that is already compressed (photos, videos, zip files) is
-  detected and stored as-is.
+  typically shrink by 75–95%. **JPEG photos are losslessly recompressed** (via JPEG XL) to about
+  15–22% smaller, and are restored byte-for-byte. Other data that is already compressed (videos,
+  zip files) is detected and stored as-is.
 - **Hard to crack.** AES-256-GCM authenticated encryption, with passwords hardened by
   **Argon2id** (256 MiB of RAM per guess by default, or 1 GiB with `--profile paranoid`).
   Any tampering, truncation or wrong password is detected. Nothing is ever silently corrupted.
@@ -27,6 +28,8 @@ key), and restores them byte-for-byte.
 | Hide the exact size | `--pad` (Padmé padding, ≤ 12% overhead) |
 | Survive disk damage | `--recovery` (Reed-Solomon, +14%, repairs bursts up to 4 KB per 64 KB) |
 | Remove the originals | `--shred` (only after the new file is verified) |
+| Change the password / recipients | `crunchlock rekey file.clk` (no recompression needed) |
+| Keep photos untouched | `--no-jpeg` (turns off lossless JPEG recompression) |
 
 ## Download (no Python needed)
 
@@ -38,7 +41,16 @@ GitHub Actions:
 - **Latest build:** open the **Actions** tab, choose the newest *Test & build executables*
   run, and download `crunchlock-Windows` (or `-macOS` / `-Linux`) under *Artifacts*.
 
-Each download contains:
+On Windows the easiest option is the **installer**, `Crunchlock-Setup-x.y.z.exe` (artifact
+`crunchlock-Windows-installer`). It installs for your user without needing admin rights, and
+adds:
+- a Start-menu entry (plus a desktop shortcut if you want one);
+- **right-click → "Lock with Crunchlock"** on any file or folder (selecting several files
+  sends them all to the same window);
+- **double-click a `.clk` file** to open it on the Unlock tab.
+
+You can uninstall it from *Settings → Apps*. If you'd rather not install anything, the
+`crunchlock-Windows` zip contains the same programs:
 - `CrunchlockGUI.exe`: the desktop app. Double-click to run.
 - `crunchlock.exe`: the command-line tool.
 
@@ -84,6 +96,8 @@ crunchlock lock movie.mp4 -n                  # encrypt only
 crunchlock lock project/ --recovery --split 100M --pad
 
 crunchlock info taxes.clk                     # no password needed
+crunchlock rekey taxes.clk                    # change the password (asks for old + new)
+crunchlock rekey taxes.clk -r bob.clkpub --no-password   # from now on only Bob's key opens it
 crunchlock verify taxes.clk --list
 crunchlock unlock taxes.clk -o ~/restored
 
@@ -106,12 +120,19 @@ Exit codes: `0` ok, `1` error, `2` wrong password or key.
 crunchlock-gui
 ```
 
+It follows your system's light or dark mode, and you can switch with the button in the header.
+**Drag and drop** files or folders onto the window to lock them. Drop a `.clk` file to unlock
+it. Long operations show a progress bar with a **Cancel** button; cancelling removes any
+partial output.
+
 The window has three tabs:
-- **Lock:** add files/folders, tick or untick *Compress*, set a password (with a strength meter
-  and *Generate* button), and optionally add a keyfile or recipients, padding, recovery data,
-  splitting or secure delete.
-- **Unlock:** pick a `.clk` (or `.clk.001`), then *Verify only* or *Unlock*.
-- **Passphrases & Keys:** a passphrase generator (copied passphrases are cleared from the
+- **Lock:** add files/folders, choose a compression preset (or switch compression off), and
+  optionally shrink JPEG photos losslessly. Set a password (with a strength meter and
+  *Generate* button). Under *Advanced options*: keyfile, recipients, padding, recovery data,
+  splitting and secure delete.
+- **Unlock:** pick a `.clk` (or `.clk.001`), then *Check only* or *Unlock*. **Change the
+  password or who can open the file** under the section of that name.
+- **Passphrases & keys:** a passphrase generator (copied passphrases are cleared from the
   clipboard after 30 s) and key-pair creation.
 
 ## Security model
@@ -138,6 +159,13 @@ files ─ tar ─▶ zstd/xz (optional) ─▶ AES-256-GCM in 1 MiB chunks ─�
   place after the *entire* file has been authenticated. Path traversal (`../`), absolute paths,
   escaping symlinks and device files are rejected (Python's tarfile `data` filter). Existing
   files are never overwritten without `--force`.
+- **Changing the password** (`rekey`) creates a brand-new file key and re-encrypts every chunk
+  with it. The data is not decompressed, so it's fast, roughly disk speed. The original file is
+  replaced only after every chunk has been authenticated, so a wrong password, damage or
+  cancelling leaves it untouched. Old passwords and keys stop working.
+- **JPEG recompression** is checked file by file: each photo is converted, decoded straight
+  back, and compared byte-for-byte with the original. Anything that doesn't match exactly (for
+  example CMYK JPEGs) is stored unchanged.
 - **Symlinks** inside a locked folder are preserved. A link that points *outside* the selection
   is stored as a copy of its target file, or skipped. Either way you get a warning, and
   `--shred` will then not delete the originals.
@@ -158,6 +186,9 @@ files ─ tar ─▶ zstd/xz (optional) ─▶ AES-256-GCM in 1 MiB chunks ─�
 
 ```
 "CRLK" | version u8 | flags u8 | chunk_size u32 | nonce_prefix 7B | slot_count u8 | slots…
+  flags: 0x01 = may contain JPEGs stored as JPEG XL (tar PAX header CRUNCHLOCK.jxl=1,
+         original size in CRUNCHLOCK.size). Unknown flags are refused, so older versions
+         never mis-extract newer files.
   password slot: 1 | t u32 | mem_kib u32 | par u8 | keyfile u8 | salt 16B | nonce 12B | wrapped_key 48B
   X25519 slot:   2 | ephemeral_pub 32B | nonce 12B | wrapped_key 48B
 chunks: AES-GCM( u32 data_len ‖ data ‖ zero padding ), 16-byte tag each, last one flagged in the nonce

@@ -29,6 +29,11 @@ MAX_SLOTS = 64
 MIN_CHUNK = 1024
 MAX_CHUNK = 64 * 1024 * 1024
 
+# Header flags. Readers refuse files with flags they don't know, so an older
+# version never silently mis-extracts data it can't understand.
+FLAG_JPEG_XL = 0x01  # archive may contain JPEGs losslessly recompressed as JPEG XL
+KNOWN_FLAGS = FLAG_JPEG_XL
+
 SLOT_PASSWORD = 1
 SLOT_X25519 = 2
 
@@ -103,8 +108,8 @@ def read_header(f: BinaryIO) -> tuple[Header, bytes]:
         raise CorruptFileError("not a crunchlock file (bad magic)")
     if version != VERSION:
         raise CrunchlockError(f"unsupported file version {version}; please upgrade crunchlock")
-    if flags != 0:
-        raise CrunchlockError("file uses features this version doesn't understand")
+    if flags & ~KNOWN_FLAGS:
+        raise CrunchlockError("file uses features this version doesn't understand; please upgrade crunchlock")
     if not MIN_CHUNK <= chunk_size <= MAX_CHUNK:
         raise CorruptFileError("invalid chunk size in header")
     count_b = _read_exact(f, 1)

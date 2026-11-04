@@ -127,6 +127,7 @@ class RSReader:
     def __init__(self, source, cols: int):
         self._s = source
         self._cols = cols
+        self.cols = cols
         self._seg_len = N * cols
         self._buf = bytearray()
         self._eof = False

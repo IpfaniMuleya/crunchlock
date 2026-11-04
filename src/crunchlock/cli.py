@@ -89,7 +89,8 @@ def cmd_lock(a) -> int:
     r = api.lock(a.paths, a.output, password=password or None, keyfile=keyfile,
                  recipients=recipients, compression="none" if a.no_compress else a.compress,
                  level=a.level, kdf_profile=a.profile, pad=a.pad, recovery_data=a.recovery,
-                 split_size=split, shred_originals=a.shred, force=a.force, progress=prog)
+                 split_size=split, shred_originals=a.shred, force=a.force, jpeg=not a.no_jpeg,
+                 progress=prog)
     prog.done()
     for o in r.outputs:
         print(f"wrote {o}")
@@ -156,12 +157,36 @@ def cmd_verify(a) -> int:
     return 0
 
 
+def cmd_rekey(a) -> int:
+    password, keyfile, identity = _secrets_for_open(a)
+    recipients = [api.load_recipient(r) for r in a.recipient or []]
+    new_keyfile = read_keyfile(a.new_keyfile)
+    new_password = None
+    if not a.no_password:
+        if sys.stdin.isatty() and not os.environ.get(ENV_PASSWORD + "_NEW"):
+            print("Choose the new password (press Enter twice to keep the current one).", file=sys.stderr)
+            new_password = ask_password(True, "New password: ", allow_env=False) or password
+        else:
+            new_password = os.environ.get(ENV_PASSWORD + "_NEW") or password
+        if not new_password and new_keyfile is None and not recipients:
+            raise CrunchlockError("no new password given")
+    prog = ProgressPrinter(not a.quiet)
+    r = api.rekey(a.file, password=password, keyfile=keyfile, identity=identity,
+                  new_password=new_password, new_keyfile=new_keyfile, recipients=recipients,
+                  kdf_profile=a.profile, progress=prog)
+    prog.done()
+    print(f"updated {', '.join(str(o) for o in r.outputs)}")
+    print(f"  now opens with: {r.unlock_with}")
+    return 0
+
+
 def cmd_info(a) -> int:
     m = api.info(a.file)
     print(f"file:          {', '.join(m['parts'])}")
     print(f"size:          {human(m['size'])}")
     print(f"format:        crunchlock v{m['format_version']}, {m['cipher']}")
     print(f"recovery data: {'yes' if m['recovery_data'] else 'no'}")
+    print(f"JPEG recompr.: {'yes' if m['jpeg_recompression'] else 'no'}")
     for s in m["key_slots"]:
         extra = (f" (argon2id, {s['memory_mib']} MiB, t={s['time_cost']}, p={s['parallelism']})"
                  if "kdf" in s else "")
@@ -223,6 +248,8 @@ def build_parser() -> argparse.ArgumentParser:
     lk.add_argument("--password-too", action="store_true",
                     help="with --recipient: also allow unlocking with a password")
     lk.add_argument("--no-password", action="store_true", help=argparse.SUPPRESS)
+    lk.add_argument("--no-jpeg", action="store_true",
+                    help="don't losslessly recompress JPEG photos (on by default, ~20%% smaller)")
     lk.add_argument("--pad", action="store_true", help="pad output to hide the exact size")
     lk.add_argument("--recovery", action="store_true",
                     help="add ~14%% Reed-Solomon data so damaged files can be repaired")
@@ -247,6 +274,14 @@ def build_parser() -> argparse.ArgumentParser:
     ul.add_argument("-f", "--force", action="store_true", help="overwrite existing files")
     vf = opener("verify", "check password and integrity without extracting", cmd_verify)
     vf.add_argument("--list", action="store_true", help="list contents")
+
+    rk = opener("rekey", "change the password, keyfile or recipients of a .clk file", cmd_rekey)
+    rk.add_argument("--new-keyfile", help="require this keyfile from now on")
+    rk.add_argument("-r", "--recipient", action="append",
+                    help="public key that can unlock from now on; repeatable")
+    rk.add_argument("--no-password", action="store_true",
+                    help="remove the password (then only --new-keyfile / --recipient open it)")
+    rk.add_argument("--profile", default="standard", choices=profiles)
 
     inf = sub.add_parser("info", help="show file details (no password needed)")
     inf.add_argument("file")
@@ -277,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"crunchlock: error: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("\ncrunchlock: cancelled", file=sys.stderr)
+        print("\ncrunchlock: cancelled; nothing was written", file=sys.stderr)
         return 130
 
 

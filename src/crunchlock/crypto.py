@@ -122,7 +122,8 @@ class DecryptReader:
         self.bytes_in += len(out)
         return bytes(out)
 
-    def _next_chunk(self) -> None:
+    def _decrypt_next(self) -> tuple[bytes, bool]:
+        """Decrypt and validate the next chunk; return (raw plaintext, is_last)."""
         ct = self._read_ct(self._ct_len + 1)
         if len(ct) > self._ct_len:
             self._pending = ct[self._ct_len:]
@@ -144,14 +145,24 @@ class DecryptReader:
         (n,) = _LEN.unpack_from(pt)
         if n > len(pt) - 4 or (self._data_ended and n):
             raise CorruptFileError("malformed chunk")
-        if n:
-            self._buf += pt[4:4 + n]
         if n < self._cs:
             self._data_ended = True
         if self._progress:
             self._progress(self.bytes_in)
         if last:
             self._done = True
+        return pt, last
+
+    def _next_chunk(self) -> None:
+        pt, _ = self._decrypt_next()
+        (n,) = _LEN.unpack_from(pt)
+        if n:
+            self._buf += pt[4:4 + n]
+
+    def iter_chunks(self):
+        """Yield (raw chunk plaintext, is_last) for every remaining chunk."""
+        while not self._done:
+            yield self._decrypt_next()
 
     def read(self, n: int = -1) -> bytes:
         if n is None or n < 0:
@@ -174,3 +185,19 @@ class DecryptReader:
     @property
     def finished(self) -> bool:
         return self._done and not self._buf
+
+
+def reencrypt(reader: DecryptReader, target, header_bytes: bytes, file_key: bytes,
+              nonce_prefix: bytes) -> None:
+    """Re-encrypt every chunk from *reader* under a new key/header, unchanged inside.
+
+    Chunk boundaries, padding and the compressed payload are kept exactly, so no
+    decompression or recompression is needed.
+    """
+    aead = AESGCM(file_key)
+    target.write(header_bytes)
+    counter = 0
+    for pt, last in reader.iter_chunks():
+        target.write(aead.encrypt(_nonce(nonce_prefix, counter, last), pt, header_bytes))
+        counter += 1
+    target.close()

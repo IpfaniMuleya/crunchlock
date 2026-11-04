@@ -16,15 +16,25 @@ if not exist .venv\Scripts\python.exe %PY% -m venv .venv || goto :fail
 
 echo [2/3] Installing crunchlock and PyInstaller ...
 .venv\Scripts\python.exe -m pip install --upgrade pip || goto :fail
-.venv\Scripts\python.exe -m pip install . pyinstaller || goto :fail
+.venv\Scripts\python.exe -m pip install . pyinstaller pillow || goto :fail
 
 echo [3/3] Building the executables (takes a minute or two) ...
 .venv\Scripts\python.exe packaging\build.py || goto :fail
+
+set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+for /f %%v in ('.venv\Scripts\python.exe -c "import crunchlock; print(crunchlock.__version__)"') do set "VER=%%v"
+if exist "%ISCC%" (
+  echo Building the installer with Inno Setup ...
+  "%ISCC%" /Q "/DAppVersion=%VER%" "/DDistDir=%CD%\dist" "/DIconFile=%CD%\build\icons\crunchlock.ico" packaging\windows\crunchlock.iss || goto :fail
+) else (
+  echo Tip: install Inno Setup 6 from https://jrsoftware.org to also get an installer.
+)
 
 echo.
 echo Done! Your programs are in the "dist" folder:
 echo   CrunchlockGUI.exe  - the desktop app (double-click it)
 echo   crunchlock.exe     - the command-line tool
+if exist "%ISCC%" echo   Crunchlock-Setup-*.exe - installer (Start menu, right-click menu, .clk files)
 start "" "%CD%\dist"
 pause
 exit /b 0

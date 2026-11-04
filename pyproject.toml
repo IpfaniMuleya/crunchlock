@@ -16,6 +16,8 @@ dependencies = [
     "reedsolo>=1.7",
     "numpy>=1.24",
     "sv-ttk>=2.6",
+    "tkinterdnd2>=0.4",
+    "imagecodecs>=2024.1.1",
 ]
 
 [project.optional-dependencies]

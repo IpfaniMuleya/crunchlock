@@ -1,5 +1,6 @@
 import io
 import os
+import sys
 import tarfile
 
 import pytest
@@ -166,6 +167,7 @@ def test_path_traversal_rejected(tmp_path, name, kind):
     assert not dest.exists() or not any(dest.iterdir())
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX absolute-path case")
 def test_absolute_paths_are_kept_inside_destination(tmp_path):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:

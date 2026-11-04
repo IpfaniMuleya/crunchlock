@@ -1,4 +1,5 @@
 import os
+import sys
 
 import pytest
 
@@ -117,6 +118,7 @@ def test_info_needs_no_password_and_leaks_no_names(tmp_path, sample):
     assert b"notes.txt" not in raw and b"docs" not in raw
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="creating symlinks needs admin rights on Windows")
 def test_symlinks(tmp_path):
     outside = tmp_path / "outside.txt"
     outside.write_text("outside data")

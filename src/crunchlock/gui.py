@@ -20,9 +20,14 @@ try:
 except ImportError:  # pragma: no cover - the app still works with the stock theme
     sv_ttk = None
 
-from . import api, kdf, keys, passgen
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except Exception:  # noqa: BLE001 - drag and drop is optional
+    TkinterDnD = None
+
+from . import api, instance, jpeg, kdf, keys, passgen
 from .cli import human
-from .errors import CrunchlockError, WrongKeyError
+from .errors import CancelledError, CrunchlockError, WrongKeyError
 from .shred import WARNING as SHRED_WARNING
 from .split import parse_size
 
@@ -147,18 +152,25 @@ class Worker:
         self.on_done = lambda *a: None
         self.q: queue.Queue = queue.Queue()
         self.busy = False
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
 
     def start(self, fn):
         self.busy = True
+        self.cancelled = False
 
         def progress(stage, done, total):
+            if self.cancelled:
+                raise CancelledError("cancelled")
             self.q.put(("progress", stage, done, total))
 
         def run():
             try:
                 self.q.put(("done", fn(progress), None))
             except Exception as e:  # noqa: BLE001 - reported to the user
-                if not isinstance(e, (CrunchlockError, OSError, ValueError)):
+                if not isinstance(e, (CrunchlockError, OSError, ValueError, KeyboardInterrupt)):
                     traceback.print_exc()
                 self.q.put(("done", None, e))
 
@@ -372,8 +384,10 @@ class Status(ttk.Frame):
     def progress(self, stage, done, total):
         if not self.bar.winfo_ismapped():
             self.bar.pack(fill="x", pady=(0, 6), before=self.label)
-        self.action.pack_forget()
         self.label.configure(style="TLabel")
+        if not self.action.winfo_ismapped() or self.action["text"] != "Cancel":
+            self.action.configure(text="Cancel", command=self._cancel, state="normal")
+            self.action.pack(anchor="w", pady=(6, 0))
         if total and stage != "deriving key":
             self.bar.configure(mode="determinate")
             self.bar.stop()
@@ -385,6 +399,13 @@ class Status(ttk.Frame):
             self.label["text"] = ("Securing the key… (deliberately slow, so password guessing is slow too)"
                                   if stage == "deriving key" else f"{stage.capitalize()}…")
 
+    def _cancel(self):
+        self.app.worker.cancel()
+        self.action.configure(text="Cancelling…", state="disabled")
+
+    def cancelled(self):
+        self.show("Cancelled. Nothing was written or changed.", "info")
+
     def show(self, text, kind="info", action=None):
         self.bar.stop()
         self.bar.pack_forget()
@@ -393,8 +414,41 @@ class Status(ttk.Frame):
         self.action.pack_forget()
         if action:
             label, cb = action
-            self.action.configure(text=label, command=cb)
+            self.action.configure(text=label, command=cb, state="normal")
             self.action.pack(anchor="w", pady=(6, 0))
+
+
+class RecipientList(ttk.Frame):
+    """Public keys (.clkpub) of people who should be able to open the file."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.tree = ttk.Treeview(self, show="tree", height=2)
+        self.tree.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        rb = ttk.Frame(self)
+        rb.pack(side="left", anchor="n")
+        ttk.Button(rb, text="Add public key…", command=self.add).pack(fill="x")
+        ttk.Button(rb, text="Remove", command=self.remove).pack(fill="x", pady=(6, 0))
+        self.paths: dict[str, str] = {}
+
+    def add(self):
+        for p in filedialog.askopenfilenames(title="Recipient public keys",
+                                             filetypes=[("Crunchlock public key", "*.clkpub"), ("All files", "*")]):
+            try:
+                pub = api.load_recipient(p)
+            except CrunchlockError as e:
+                messagebox.showerror("Invalid public key", str(e), parent=self)
+                continue
+            iid = self.tree.insert("", "end", text=f"🔑 {Path(p).stem}  ({keys.fingerprint(pub)})")
+            self.paths[iid] = p
+
+    def remove(self):
+        for iid in self.tree.selection():
+            self.tree.delete(iid)
+            self.paths.pop(iid, None)
+
+    def keys(self):
+        return [api.load_recipient(self.paths[i]) for i in self.tree.get_children()]
 
 
 def labeled_entry(master, row, label, var, browse=None, button="Browse…"):
@@ -422,7 +476,9 @@ class LockTab(ScrollFrame):
         self.tree.column("#0", stretch=True)
         self.tree.column("size", width=110, stretch=False, anchor="e")
         self.tree.grid(row=0, column=0, columnspan=4, sticky="nsew")
-        self.empty = ttk.Label(files, text="Nothing added yet. Add files or a folder to get started.",
+        self.empty = ttk.Label(files, text=("Drag files or folders here, or use the buttons below."
+                                            if TkinterDnD else
+                                            "Nothing added yet. Add files or a folder to get started."),
                                style="Muted.TLabel")
         self.empty.place(in_=self.tree, relx=0.5, rely=0.6, anchor="center")
         btns = ttk.Frame(files)
@@ -447,6 +503,11 @@ class LockTab(ScrollFrame):
         self.preset_cb.grid(row=1, column=0, sticky="w", pady=(10, 0))
         self.chint = ttk.Label(comp, text="", style="Muted.TLabel")
         self.chint.grid(row=1, column=1, sticky="w", padx=10, pady=(10, 0))
+        self.jpeg = tk.BooleanVar(value=jpeg.AVAILABLE)
+        self.jpeg_cb = ttk.Checkbutton(
+            comp, variable=self.jpeg,
+            text="Shrink JPEG photos losslessly (about 20% smaller, restored byte-for-byte)")
+        self.jpeg_cb.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         # Password
         prot = card(b, "Protection", "AES-256 encryption is always on")
@@ -464,20 +525,14 @@ class LockTab(ScrollFrame):
                       lambda: self.keyfile.set(filedialog.askopenfilename(title="Choose a keyfile")
                                                or self.keyfile.get()))
         ttk.Label(sec, text="Recipients", style="Card.TLabel").grid(row=1, column=0, sticky="nw", pady=6)
-        self.recipients = ttk.Treeview(sec, show="tree", height=2)
-        self.recipients.grid(row=1, column=1, sticky="we", padx=(10, 8), pady=6)
-        rb = ttk.Frame(sec)
-        rb.grid(row=1, column=2, sticky="n", pady=6)
-        ttk.Button(rb, text="Add public key…", command=self.add_recipient).pack(fill="x")
-        ttk.Button(rb, text="Remove", command=lambda: [self.recipients.delete(i) for i in
-                                                        self.recipients.selection()]).pack(fill="x", pady=(6, 0))
+        self.recipients = RecipientList(sec)
+        self.recipients.grid(row=1, column=1, columnspan=2, sticky="we", padx=(10, 0), pady=6)
         ttk.Checkbutton(sec, text="Also require the password (untick to unlock with private keys only)",
                         variable=self.use_pw).grid(row=2, column=1, columnspan=2, sticky="w")
         ttk.Label(sec, text="Hardening", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 4))
         self.profile = tk.StringVar(value="standard")
         ttk.Combobox(sec, textvariable=self.profile, values=["standard", "paranoid", "light"],
                      state="readonly", width=12).grid(row=3, column=1, sticky="w", padx=(10, 0), pady=(8, 4))
-        self.recipient_paths: dict[str, str] = {}
 
         opt = card(a, "File options")
         self.pad = tk.BooleanVar()
@@ -512,6 +567,7 @@ class LockTab(ScrollFrame):
     def _sync(self):
         on = self.compress.get()
         self.preset_cb.configure(state="readonly" if on else "disabled")
+        self.jpeg_cb.state(["!disabled"] if on and jpeg.AVAILABLE else ["disabled"])
         self.chint["text"] = "" if on else "Files will only be encrypted."
 
     def _add(self, paths):
@@ -548,17 +604,6 @@ class LockTab(ScrollFrame):
             self.paths.pop(iid, None)
         self._refresh()
 
-    def add_recipient(self):
-        for p in filedialog.askopenfilenames(title="Recipient public keys",
-                                             filetypes=[("Crunchlock public key", "*.clkpub"), ("All files", "*")]):
-            try:
-                pub = api.load_recipient(p)
-            except CrunchlockError as e:
-                messagebox.showerror("Invalid public key", str(e), parent=self)
-                continue
-            iid = self.recipients.insert("", "end", text=f"🔑 {Path(p).stem}  ({keys.fingerprint(pub)})")
-            self.recipient_paths[iid] = p
-
     def browse_output(self):
         p = filedialog.asksaveasfilename(title="Save locked file as", defaultextension=".clk",
                                          filetypes=[("Crunchlock file", "*.clk")])
@@ -572,7 +617,7 @@ class LockTab(ScrollFrame):
             paths = list(self.paths.values())
             if not paths:
                 raise CrunchlockError("add at least one file or folder first")
-            recips = [api.load_recipient(self.recipient_paths[i]) for i in self.recipients.get_children()]
+            recips = self.recipients.keys()
             use_pw = self.use_pw.get() or not recips
             password = self.pwbox.value() if use_pw else None
             keyfile = Path(self.keyfile.get()).read_bytes() if self.keyfile.get() else None
@@ -602,7 +647,7 @@ class LockTab(ScrollFrame):
                           level=level if self.compress.get() else None,
                           kdf_profile=self.profile.get(), pad=self.pad.get(),
                           recovery_data=self.recovery.get(), split_size=split,
-                          shred_originals=self.shred.get(), force=force)
+                          shred_originals=self.shred.get(), force=force, jpeg=self.jpeg.get())
         except (CrunchlockError, OSError, ValueError) as e:
             self.status.show(f"Can't lock yet: {e}", "error")
             self.after(50, self.scroll_to_end)
@@ -615,6 +660,9 @@ class LockTab(ScrollFrame):
 
     def done(self, result, error):
         self.button.state(["!disabled"])
+        if isinstance(error, CancelledError):
+            self.status.cancelled()
+            return
         if error:
             self.status.show(f"Lock failed: {error}", "error")
             self.after(50, self.scroll_to_end)
@@ -686,6 +734,92 @@ class UnlockTab(ScrollFrame):
         self.status.pack(fill="x", pady=(GAP, 0))
         self.file.trace_add("write", lambda *_: self.show_info())
 
+        change = Collapsible(b, "Change the password or who can open this file")
+        change.pack(fill="x", pady=(GAP, 0))
+        cc = card(change.content, "New access", "first enter the current password or key above")
+        self.newpw = PasswordBox(cc, app, confirm=True, label="New password")
+        self.newpw.grid(row=0, column=0, columnspan=3, sticky="we")
+        ttk.Label(cc, text="Leave the new password blank to keep the current one.",
+                  style="Muted.TLabel").grid(row=1, column=1, columnspan=2, sticky="w", padx=(10, 0))
+        self.remove_pw = tk.BooleanVar()
+        ttk.Checkbutton(cc, text="Remove the password (open only with the keyfile / public keys below)",
+                        variable=self.remove_pw).grid(row=2, column=1, columnspan=2, sticky="w",
+                                                      padx=(10, 0), pady=(6, 0))
+        self.newkeyfile = tk.StringVar()
+        labeled_entry(cc, 3, "New keyfile", self.newkeyfile,
+                      lambda: self.newkeyfile.set(filedialog.askopenfilename(title="New keyfile")
+                                                  or self.newkeyfile.get()))
+        ttk.Label(cc, text="Recipients", style="Card.TLabel").grid(row=4, column=0, sticky="nw", pady=6)
+        self.newrecips = RecipientList(cc)
+        self.newrecips.grid(row=4, column=1, columnspan=2, sticky="we", padx=(10, 0), pady=6)
+        self.apply_btn = ttk.Button(cc, text="Apply changes", style="Accent.TButton", command=self.rekey)
+        self.apply_btn.grid(row=5, column=2, sticky="e", pady=(8, 0))
+
+    def _current_secrets(self):
+        keyfile = Path(self.keyfile.get()).read_bytes() if self.keyfile.get() else None
+        identity = (api.load_identity(self.identity.get(), self.idpw.value())
+                    if self.identity.get() else None)
+        return self.pwbox.value() or None, keyfile, identity
+
+    def _buttons(self, enabled: bool):
+        for btn in (self.verify_btn, self.unlock_btn, self.apply_btn):
+            btn.state(["!disabled"] if enabled else ["disabled"])
+
+    def rekey(self):
+        if self.app.worker.busy:
+            return
+        try:
+            f = self.file.get()
+            if not f:
+                raise CrunchlockError("choose a .clk file first")
+            password, keyfile, identity = self._current_secrets()
+            new_pw = self.newpw.value()
+            if self.remove_pw.get():
+                new_pw = None
+            elif not new_pw:
+                new_pw = password
+            new_keyfile = Path(self.newkeyfile.get()).read_bytes() if self.newkeyfile.get() else None
+            recips = self.newrecips.keys()
+            if not new_pw and new_keyfile is None and not recips:
+                raise CrunchlockError("the file needs a password, keyfile or at least one public key")
+            if new_pw and new_pw != password:
+                bits = passgen.estimate_bits(new_pw)
+                if passgen.rating(bits) in ("weak", "fair") and not messagebox.askyesno(
+                        "Weak password", f"The new password looks {passgen.rating(bits)}. Use it anyway?",
+                        parent=self):
+                    return
+            if not messagebox.askyesno(
+                    "Change access?", f"From now on, {Path(f).name} will open ONLY with the new "
+                    "settings. Old passwords/keys will stop working. Continue?", parent=self):
+                return
+        except WrongKeyError as e:
+            self.status.show(f"Wrong private-key passphrase: {e}", "error")
+            return
+        except (CrunchlockError, OSError) as e:
+            self.status.show(f"Can't change it yet: {e}", "error")
+            return
+        self._buttons(False)
+        self.app.worker.on_progress = self.status.progress
+        self.app.worker.on_done = self._rekey_done
+        self.app.worker.start(lambda prog: api.rekey(
+            f, password=password, keyfile=keyfile, identity=identity, new_password=new_pw,
+            new_keyfile=new_keyfile, recipients=recips, progress=prog))
+
+    def _rekey_done(self, result, error):
+        self._buttons(True)
+        if isinstance(error, CancelledError):
+            self.status.cancelled()
+            return
+        if error:
+            prefix = "Wrong password or key" if isinstance(error, WrongKeyError) else "Failed"
+            self.status.show(f"{prefix}: {error}", "error")
+            return
+        for box in (self.pwbox, self.idpw, self.newpw):
+            box.clear()
+        self.show_info()
+        self.status.show(f"✓  Access updated. {Path(self.file.get()).name} now opens with: "
+                         f"{result.unlock_with}", "ok")
+
     def browse(self):
         p = filedialog.askopenfilename(title="Choose a locked file",
                                        filetypes=[("Crunchlock", "*.clk *.clk.001"), ("All files", "*")])
@@ -713,10 +847,7 @@ class UnlockTab(ScrollFrame):
             f = self.file.get()
             if not f:
                 raise CrunchlockError("choose a .clk file first")
-            keyfile = Path(self.keyfile.get()).read_bytes() if self.keyfile.get() else None
-            identity = (api.load_identity(self.identity.get(), self.idpw.value())
-                        if self.identity.get() else None)
-            password = self.pwbox.value() or None
+            password, keyfile, identity = self._current_secrets()
             dest = self.dest.get() or None
             force = self.force.get()
         except WrongKeyError as e:
@@ -725,8 +856,7 @@ class UnlockTab(ScrollFrame):
         except (CrunchlockError, OSError) as e:
             self.status.show(f"Can't unlock yet: {e}", "error")
             return
-        for btn in (self.verify_btn, self.unlock_btn):
-            btn.state(["disabled"])
+        self._buttons(False)
         self.app.worker.on_progress = self.status.progress
         self.app.worker.on_done = lambda r, e: self.done(r, e, verify)
         if verify:
@@ -738,8 +868,10 @@ class UnlockTab(ScrollFrame):
         self.app.worker.start(job)
 
     def done(self, result, error, verify):
-        for btn in (self.verify_btn, self.unlock_btn):
-            btn.state(["!disabled"])
+        self._buttons(True)
+        if isinstance(error, CancelledError):
+            self.status.cancelled()
+            return
         if error:
             prefix = "Wrong password or key" if isinstance(error, WrongKeyError) else "Failed"
             self.status.show(f"{prefix}: {error}", "error")
@@ -897,11 +1029,66 @@ class App:
         self.notebook = nb
         self.themed += [self.lock_tab, self.unlock_tab, self.tools_tab]
         self._recolor()
+        self.incoming: queue.Queue = queue.Queue()
+        self._enable_drop(root)
+        root.after(200, self._poll_incoming)
 
         w = min(860, int(root.winfo_screenwidth() * 0.9))
         h = min(900, int(root.winfo_screenheight() * 0.88))
         root.geometry(f"{w}x{h}")
         root.minsize(640, 480)
+
+    # -- files arriving from drag and drop, the command line or other launches
+
+    def open_paths(self, paths):
+        paths = [os.path.abspath(p) for p in paths if p]
+        locked = [p for p in paths if p.lower().endswith((".clk", ".clk.001"))]
+        others = [p for p in paths if p not in locked]
+        if locked and not others:
+            self.unlock_tab.file.set(locked[0])
+            if not self.unlock_tab.dest.get():
+                self.unlock_tab.dest.set(str(Path(locked[0]).parent))
+            self.notebook.select(self.unlock_tab)
+        elif paths:
+            self.lock_tab._add(paths)
+            self.notebook.select(self.lock_tab)
+
+    def bring_to_front(self):
+        r = self.root
+        r.deiconify()
+        r.lift()
+        r.attributes("-topmost", True)
+        r.after(300, lambda: r.attributes("-topmost", False))
+        r.focus_force()
+
+    def _poll_incoming(self):
+        try:
+            while True:
+                paths = self.incoming.get_nowait()
+                self.bring_to_front()
+                self.open_paths(paths)
+        except queue.Empty:
+            pass
+        self.root.after(200, self._poll_incoming)
+
+    def _enable_drop(self, root):
+        if TkinterDnD is None or not hasattr(root, "drop_target_register"):
+            return
+
+        def on_drop(event):
+            self.open_paths(root.tk.splitlist(event.data))
+            return event.action
+
+        def register(w):
+            try:
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind("<<Drop>>", on_drop)
+            except (tk.TclError, AttributeError):
+                pass
+            for child in w.winfo_children():
+                register(child)
+
+        register(root)
 
     def _apply_theme(self):
         style = ttk.Style(self.root)
@@ -955,16 +1142,33 @@ def main(argv=None) -> int:
     if tk is None:
         print("crunchlock-gui needs Tkinter (e.g. `sudo apt install python3-tk`).", file=sys.stderr)
         return 1
+    paths = [os.path.abspath(p) for p in (argv if argv is not None else sys.argv[1:])]
+    # If a window is already open, hand the files to it instead of opening another.
+    single = os.environ.get("CRUNCHLOCK_MULTI_INSTANCE") != "1"
+    if single and instance.hand_off_or_become_primary(paths):
+        return 0
     enable_high_dpi()
-    root = tk.Tk()
+    root = None
+    if TkinterDnD is not None:
+        try:
+            root = TkinterDnD.Tk()
+        except Exception:  # noqa: BLE001 - tkdnd library unavailable: no drag and drop
+            root = None
+    root = root or tk.Tk()
     app = App(root)
-    for p in (argv if argv is not None else sys.argv[1:]):
-        if p.endswith(".clk") or p.endswith(".001"):
-            app.unlock_tab.file.set(p)
-            app.notebook.select(app.unlock_tab)
-        else:
-            app.lock_tab._add([os.path.abspath(p)])
-    root.mainloop()
+    server = None
+    if single:
+        try:
+            server = instance.Server(app.incoming.put)
+        except OSError:
+            pass
+        instance.release_startup_lock()
+    app.open_paths(paths)
+    try:
+        root.mainloop()
+    finally:
+        if server:
+            server.close()
     return 0
 
 

@@ -1,13 +1,16 @@
 """Pack many files/folders into a tar stream; extract safely."""
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import tarfile
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
+from . import jpeg
 from .errors import CorruptFileError, CrunchlockError
 
 if not hasattr(tarfile, "data_filter"):  # Python < 3.10.12 / 3.11.4
@@ -66,7 +69,65 @@ def _within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
-def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = None) -> list[str]:
+class PackStats:
+    def __init__(self):
+        self.warnings: list[str] = []
+        self.jpeg_files = 0
+        self.jpeg_saved = 0
+
+
+class _JpegPrefetcher:
+    """Transcodes upcoming JPEGs on worker threads, a bounded window ahead."""
+
+    def __init__(self, items, enabled: bool):
+        self._cands = []
+        if enabled and jpeg.AVAILABLE:
+            for i, (fs_path, _arc) in enumerate(items):
+                try:
+                    st = fs_path.lstat()
+                except OSError:
+                    continue
+                if not fs_path.is_symlink() and fs_path.is_file() and jpeg.is_candidate(fs_path, st.st_size):
+                    self._cands.append(i)
+        self._items = items
+        self._futures: dict[int, object] = {}
+        self._next = 0
+        self._window = max(2, 2 * (os.cpu_count() or 2))
+        self._pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 2) if self._cands else None
+        self._fill()
+
+    def _fill(self):
+        while self._pool and self._next < len(self._cands) and len(self._futures) < self._window:
+            i = self._cands[self._next]
+            self._futures[i] = self._pool.submit(self._work, self._items[i][0])
+            self._next += 1
+
+    @staticmethod
+    def _work(path: Path):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        jxl = jpeg.transcode(data)
+        return (len(data), jxl) if jxl is not None else None
+
+    def get(self, i):
+        fut = self._futures.pop(i, None)
+        if fut is None:
+            return None
+        result = fut.result()
+        self._fill()
+        return result
+
+    def close(self):
+        if self._pool:
+            for f in self._futures.values():
+                f.cancel()
+            self._pool.shutdown(wait=True)
+
+
+def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = None,
+         jpeg_recompress: bool = False, stats: PackStats | None = None) -> list[str]:
     """Write a tar stream of *paths* into *writer* (any object with .write).
 
     Symlinks that point inside the locked folder are kept (made relative).
@@ -74,7 +135,8 @@ def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = Non
     stored as a copy of that file and anything else is skipped. Returns
     human-readable warnings about such cases.
     """
-    warnings: list[str] = []
+    stats = stats if stats is not None else PackStats()
+    warnings = stats.warnings
     with tarfile.open(fileobj=writer, mode="w|", format=tarfile.PAX_FORMAT,
                       bufsize=READ_BLOCK) as tf:
 
@@ -102,31 +164,84 @@ def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = Non
                     rel = Path(root).relative_to(real_root)
                     for name in dirs + sorted(files):
                         items.append((Path(root, name), str(Path(arc_root, rel, name))))
-            for fs_path, arcname in items:
-                if not fs_path.is_symlink():
-                    info = tf.gettarinfo(str(fs_path), arcname=arcname)
-                    if info is not None:  # None for sockets etc.
-                        add_file(fs_path, arcname, info)
-                    continue
-                target = fs_path.resolve()
-                if real_root.is_dir() and _within(target, real_root) and target.exists():
-                    info = tf.gettarinfo(str(fs_path), arcname=arcname)
-                    info.linkname = os.path.relpath(target, fs_path.parent.resolve())
-                    info.uid = info.gid = 0
-                    info.uname = info.gname = ""
-                    tf.addfile(info)
-                elif target.is_file():
-                    info = tf.gettarinfo(str(target), arcname=arcname)
-                    add_file(target, arcname, info)
-                    warnings.append(f"{arcname}: link to {target} outside the selection; stored a copy of the file")
-                else:
-                    warnings.append(f"skipped link {arcname} -> {os.readlink(fs_path)} (points outside the selection)")
+            pre = _JpegPrefetcher(items, jpeg_recompress)
+            try:
+                for i, (fs_path, arcname) in enumerate(items):
+                    if not fs_path.is_symlink():
+                        info = tf.gettarinfo(str(fs_path), arcname=arcname)
+                        if info is None:  # sockets etc.
+                            continue
+                        jx = pre.get(i) if info.isreg() else None
+                        if jx is not None and jx[0] == info.size:
+                            orig_size, jxl = jx
+                            info.uid = info.gid = 0
+                            info.uname = info.gname = ""
+                            info.size = len(jxl)
+                            info.pax_headers = {jpeg.PAX_KEY: "1", jpeg.PAX_SIZE: str(orig_size)}
+                            tf.addfile(info, io.BytesIO(jxl))
+                            stats.jpeg_files += 1
+                            stats.jpeg_saved += orig_size - len(jxl)
+                            if progress:
+                                progress(orig_size)
+                        else:
+                            add_file(fs_path, arcname, info)
+                        continue
+                    _add_link(tf, fs_path, arcname, real_root, add_file, warnings)
+            finally:
+                pre.close()
     return warnings
+
+
+def _add_link(tf, fs_path: Path, arcname: str, real_root: Path, add_file, warnings: list[str]) -> None:
+    """Store a symlink found inside a locked folder (see pack() for the rules)."""
+    target = fs_path.resolve()
+    if real_root.is_dir() and _within(target, real_root) and target.exists():
+        info = tf.gettarinfo(str(fs_path), arcname=arcname)
+        info.linkname = os.path.relpath(target, fs_path.parent.resolve())
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        tf.addfile(info)
+    elif target.is_file():
+        info = tf.gettarinfo(str(target), arcname=arcname)
+        add_file(target, arcname, info)
+        warnings.append(f"{arcname}: link to {target} outside the selection; stored a copy of the file")
+    else:
+        warnings.append(f"skipped link {arcname} -> {os.readlink(fs_path)} (points outside the selection)")
 
 
 def _drain(stream) -> None:
     while stream.read(READ_BLOCK):
         pass
+
+
+def _is_jxl(m: tarfile.TarInfo) -> bool:
+    return m.isreg() and m.pax_headers.get(jpeg.PAX_KEY) == "1"
+
+
+def _restore_jpeg(tf: tarfile.TarFile, m: tarfile.TarInfo) -> bytes:
+    try:
+        size = int(m.pax_headers.get(jpeg.PAX_SIZE, ""))
+    except ValueError:
+        raise CorruptFileError("malformed recompressed-JPEG entry") from None
+    return jpeg.restore(tf.extractfile(m).read(), size)
+
+
+def _extract_jpeg(tf: tarfile.TarFile, m: tarfile.TarInfo, staging: Path) -> None:
+    try:
+        safe = tarfile.data_filter(m, str(staging))
+    except tarfile.FilterError as e:
+        raise CorruptFileError(f"unsafe entry in archive: {e}") from e
+    data = _restore_jpeg(tf, m)
+    target = staging / safe.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(target):
+        target.unlink()
+    with open(target, "xb") as f:
+        f.write(data)
+    if safe.mode is not None:
+        os.chmod(target, safe.mode)
+    if safe.mtime is not None:
+        os.utime(target, (safe.mtime, safe.mtime))
 
 
 def list_members(stream) -> list[tuple[str, int, bool]]:
@@ -140,11 +255,15 @@ def list_members(stream) -> list[tuple[str, int, bool]]:
                         tarfile.data_filter(m, fake_dest)
                     except tarfile.FilterError as e:
                         raise CorruptFileError(f"unsafe entry in archive: {e}") from e
-                    if m.isreg():
-                        f = tf.extractfile(m)
-                        while f.read(READ_BLOCK):
-                            pass
-                    entries.append((m.name, m.size, m.isdir()))
+                    if _is_jxl(m):
+                        size = len(_restore_jpeg(tf, m))  # proves it restores exactly-sized
+                    else:
+                        size = m.size
+                        if m.isreg():
+                            f = tf.extractfile(m)
+                            while f.read(READ_BLOCK):
+                                pass
+                    entries.append((m.name, size, m.isdir()))
         except tarfile.TarError as e:
             raise CorruptFileError(f"archive is malformed: {e}") from e
     _drain(stream)
@@ -164,6 +283,9 @@ def extract(stream, dest: Path, force: bool = False, before_commit: Callable[[],
         try:
             with tarfile.open(fileobj=stream, mode="r|", bufsize=READ_BLOCK) as tf:
                 for m in tf:
+                    if _is_jxl(m):
+                        _extract_jpeg(tf, m, staging)
+                        continue
                     try:
                         tf.extract(m, staging, filter="data")
                     except tarfile.FilterError as e:
