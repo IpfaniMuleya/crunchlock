@@ -168,6 +168,29 @@ jobs:
           path: artifacts
           pattern: crunchlock-{Windows,Windows-installer,Linux}
           merge-multiple: true
+      - uses: actions/checkout@v4
+        with:
+          path: src
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Checksums (signed when the release key secrets are set)
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          CRUNCHLOCK_PASSWORD_KEY: ${{ secrets.RELEASE_KEY_PASSPHRASE }}
+        run: |
+          cd artifacts
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          if [ -n "$RELEASE_SIGNING_KEY" ]; then
+            pip install --quiet -r ../src/packaging/requirements-build.txt
+            pip install --quiet --no-deps ../src
+            echo "$RELEASE_SIGNING_KEY" | base64 -d > ../release.clkkey
+            crunchlock sign-file SHA256SUMS --key ../release.clkkey
+            rm ../release.clkkey
+          else
+            echo "::notice::RELEASE_SIGNING_KEY not set: SHA256SUMS is not signed"
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*

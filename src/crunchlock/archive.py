@@ -1,6 +1,7 @@
 """Pack many files/folders into a tar stream; extract safely."""
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import shutil
@@ -18,17 +19,66 @@ if not hasattr(tarfile, "data_filter"):  # Python < 3.10.12 / 3.11.4
     raise ImportError("crunchlock needs a Python with tarfile extraction filters (3.10.12+)")
 
 READ_BLOCK = 1 << 20
+DUP_MIN = 1024              # smaller identical files aren't worth a link entry
+PAX_DUP = "CRUNCHLOCK.dup"         # this entry is a copy of its linkname (restored as a copy)
+PAX_DUPSRC = "CRUNCHLOCK.dupsrc"   # later entries are copies of this one
+PAX_SIZE = "CRUNCHLOCK.size"
 
 
 class _ProgressFile:
-    def __init__(self, f, cb):
-        self._f, self._cb = f, cb
+    def __init__(self, f, cb, digest=None):
+        self._f, self._cb, self._h = f, cb, digest
 
     def read(self, n=-1):
         b = self._f.read(n)
+        if self._h is not None:
+            self._h.update(b)
         if self._cb:
             self._cb(len(b))
         return b
+
+
+def _sha256_file(path: Path) -> str | None:
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(READ_BLOCK), b""):
+                h.update(block)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _dup_plan(items) -> tuple[set[int], dict[int, int]]:
+    """Find identical regular files: (indexes of first copies, {later copy: first copy}).
+
+    Only files whose size is shared with another file are hashed."""
+    by_size: dict[int, list[int]] = {}
+    for i, (fs_path, _arc) in enumerate(items):
+        try:
+            if fs_path.is_symlink() or not fs_path.is_file():
+                continue
+            size = fs_path.stat().st_size
+        except OSError:
+            continue
+        if size >= DUP_MIN:
+            by_size.setdefault(size, []).append(i)
+    srcs: set[int] = set()
+    dups: dict[int, int] = {}
+    for group in by_size.values():
+        if len(group) < 2:
+            continue
+        first: dict[str, int] = {}
+        for i in group:
+            d = _sha256_file(items[i][0])
+            if d is None:
+                continue
+            if d in first:
+                dups[i] = first[d]
+                srcs.add(first[d])
+            else:
+                first[d] = i
+    return srcs, dups
 
 
 def total_size(paths: list[Path]) -> int:
@@ -76,6 +126,8 @@ class PackStats:
         self.jpeg_files = 0
         self.jpeg_saved = 0
         self.png_files = 0
+        self.dup_files = 0
+        self.dup_saved = 0
 
 
 class _ImagePrefetcher:
@@ -110,20 +162,23 @@ class _ImagePrefetcher:
             self._next += 1
 
     def _work(self, path: Path):
-        """Return (original size, stored bytes, pax headers, kind) or None to store as-is."""
+        """Return (original size, stored bytes, pax headers, kind, sha256 of the original)
+        or None to store as-is."""
         try:
             data = path.read_bytes()
         except OSError:
             return None
+        digest = hashlib.sha256(data).hexdigest()
         if self._jpeg and path.suffix.lower() in jpeg.EXTENSIONS:
             jxl = jpeg.transcode(data)
             if jxl is not None:
-                return len(data), jxl, {jpeg.PAX_KEY: "1", jpeg.PAX_SIZE: str(len(data))}, "jpeg"
+                return (len(data), jxl, {jpeg.PAX_KEY: "1", jpeg.PAX_SIZE: str(len(data))},
+                        "jpeg", digest)
         if self._png and path.suffix.lower() in png.EXTENSIONS:
             raw = png.transcode(data)
             if raw is not None:
-                return len(data), raw, {png.PAX_KEY: "1", png.PAX_SIZE: str(len(data)),
-                                        png.PAX_CRC: str(zlib.crc32(data))}, "png"
+                return (len(data), raw, {png.PAX_KEY: "1", png.PAX_SIZE: str(len(data)),
+                                         png.PAX_CRC: str(zlib.crc32(data))}, "png", digest)
         return None
 
     def get(self, i):
@@ -144,7 +199,8 @@ class _ImagePrefetcher:
 def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = None,
          jpeg_recompress: bool = False, stats: PackStats | None = None,
          png_recompress: bool = False,
-         prelude: Callable[[tarfile.TarFile], None] | None = None) -> list[str]:
+         prelude: Callable[[tarfile.TarFile], None] | None = None,
+         dedup: bool = False) -> list[str]:
     """Write a tar stream of *paths* into *writer* (any object with .write).
 
     Symlinks that point inside the locked folder are kept (made relative).
@@ -153,6 +209,8 @@ def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = Non
     human-readable warnings about such cases.
 
     *prelude(tf)* may write entries first (used to copy an existing archive).
+    *dedup*: identical files (within one top-level item) are stored once; later
+    copies become link entries that extract() restores as independent copies.
     """
     stats = stats if stats is not None else PackStats()
     warnings = stats.warnings
@@ -161,14 +219,14 @@ def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = Non
         if prelude:
             prelude(tf)
 
-        def add_file(fs_path, arcname, info=None):
+        def add_file(fs_path, arcname, info=None, digest=None):
             if info is None:
                 info = tf.gettarinfo(str(fs_path), arcname=arcname)
             info.uid = info.gid = 0
             info.uname = info.gname = ""
             if info.isreg():
                 with open(fs_path, "rb") as f:
-                    tf.addfile(info, _ProgressFile(f, progress))
+                    tf.addfile(info, _ProgressFile(f, progress, digest))
             elif info.isdir() or info.islnk():
                 tf.addfile(info)
 
@@ -185,6 +243,8 @@ def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = Non
                     rel = Path(root).relative_to(real_root)
                     for name in dirs + sorted(files):
                         items.append((Path(root, name), str(Path(arc_root, rel, name))))
+            srcs, dups = _dup_plan(items) if dedup else (set(), {})
+            written: dict[int, str] = {}  # sha256 of each first copy, as actually stored
             pre = _ImagePrefetcher(items, jpeg_recompress, png_recompress)
             try:
                 for i, (fs_path, arcname) in enumerate(items):
@@ -193,8 +253,25 @@ def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = Non
                         if info is None:  # sockets etc.
                             continue
                         tx = pre.get(i) if info.isreg() else None
+                        if i in dups and info.isreg() and dups[i] in written \
+                                and _sha256_file(fs_path) == written[dups[i]]:
+                            # Checked again now, in case a file changed since the scan.
+                            link = tarfile.TarInfo(arcname)
+                            link.type = tarfile.LNKTYPE
+                            link.linkname = items[dups[i]][1]
+                            link.mode, link.mtime = info.mode, info.mtime
+                            link.pax_headers = {PAX_DUP: "1", PAX_SIZE: str(info.size)}
+                            tf.addfile(link)
+                            stats.dup_files += 1
+                            stats.dup_saved += info.size
+                            if progress:
+                                progress(info.size)
+                            continue
                         if tx is not None and tx[0] == info.size:
-                            orig_size, stored, pax, kind = tx
+                            orig_size, stored, pax, kind, digest = tx
+                            if i in srcs:
+                                pax = {**pax, PAX_DUPSRC: "1"}
+                                written[i] = digest
                             info.uid = info.gid = 0
                             info.uname = info.gname = ""
                             info.size = len(stored)
@@ -207,6 +284,11 @@ def pack(paths: list[Path], writer, progress: Callable[[int], None] | None = Non
                                 stats.png_files += 1
                             if progress:
                                 progress(orig_size)
+                        elif i in srcs and info.isreg():
+                            h = hashlib.sha256()
+                            info.pax_headers = {PAX_DUPSRC: "1"}
+                            add_file(fs_path, arcname, info, h)
+                            written[i] = h.hexdigest()
                         else:
                             add_file(fs_path, arcname, info)
                         continue
@@ -236,6 +318,49 @@ def _add_link(tf, fs_path: Path, arcname: str, real_root: Path, add_file, warnin
 def _drain(stream) -> None:
     while stream.read(READ_BLOCK):
         pass
+
+
+def _is_dup(m: tarfile.TarInfo) -> bool:
+    return m.islnk() and m.pax_headers.get(PAX_DUP) == "1"
+
+
+def _dup_size(m: tarfile.TarInfo) -> int:
+    try:
+        return int(m.pax_headers.get(PAX_SIZE, ""))
+    except ValueError:
+        raise CorruptFileError("malformed duplicate-file entry") from None
+
+
+def _extract_one(tf: tarfile.TarFile, m: tarfile.TarInfo, root: Path) -> Path:
+    """Extract *m* under *root*; return where it went."""
+    if _is_transformed(m):
+        return _extract_transformed(tf, m, root)
+    try:
+        safe = tarfile.data_filter(m, str(root))
+        tf.extract(m, root, filter="data")
+    except tarfile.FilterError as e:
+        raise CorruptFileError(f"unsafe entry in archive: {e}") from e
+    return root / safe.name
+
+
+def _extract_dup(m: tarfile.TarInfo, sources: dict[str, Path], staging: Path) -> None:
+    """Restore a stored-once duplicate as an independent copy of its original."""
+    try:
+        safe = tarfile.data_filter(m, str(staging))
+    except tarfile.FilterError as e:
+        raise CorruptFileError(f"unsafe entry in archive: {e}") from e
+    src = sources.get(m.linkname)
+    if src is None or not src.is_file() or src.stat().st_size != _dup_size(m):
+        raise CorruptFileError(f"the original of duplicate {m.name!r} is missing")
+    target = staging / safe.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(target):
+        target.unlink()
+    shutil.copyfile(src, target)
+    if safe.mode is not None:
+        os.chmod(target, safe.mode)
+    if safe.mtime is not None:
+        os.utime(target, (safe.mtime, safe.mtime))
 
 
 def _is_transformed(m: tarfile.TarInfo) -> bool:
@@ -272,6 +397,7 @@ def _extract_transformed(tf: tarfile.TarFile, m: tarfile.TarInfo, staging: Path)
         os.chmod(target, safe.mode)
     if safe.mtime is not None:
         os.utime(target, (safe.mtime, safe.mtime))
+    return target
 
 
 def list_members(stream) -> list[tuple[str, int, bool]]:
@@ -287,6 +413,8 @@ def list_members(stream) -> list[tuple[str, int, bool]]:
                         raise CorruptFileError(f"unsafe entry in archive: {e}") from e
                     if _is_transformed(m):
                         size = len(_restore(tf, m))  # proves it restores exactly
+                    elif _is_dup(m):
+                        size = _dup_size(m)
                     else:
                         size = m.size
                         if m.isreg():
@@ -414,21 +542,27 @@ def extract(stream, dest: Path, force: bool = False, before_commit: Callable[[],
             raise CrunchlockError("nothing selected to extract")
     found: set[str] = set()
     staging = Path(tempfile.mkdtemp(prefix=".crunchlock-", dir=dest))
+    stash = None  # originals of chosen duplicates that weren't chosen themselves
+    sources: dict[str, Path] = {}
     try:
         try:
             with tarfile.open(fileobj=stream, mode="r|", bufsize=READ_BLOCK) as tf:
                 for m in tf:
+                    is_src = m.isreg() and m.pax_headers.get(PAX_DUPSRC) == "1"
                     if not _selected(m.name, only):
+                        if is_src:
+                            if stash is None:
+                                stash = Path(tempfile.mkdtemp(prefix=".crunchlock-", dir=dest))
+                            sources[m.name] = _extract_one(tf, m, stash)
                         continue
                     if only is not None:
                         found.update(o for o in only if _selected(m.name, [o]))
-                    if _is_transformed(m):
-                        _extract_transformed(tf, m, staging)
+                    if _is_dup(m):
+                        _extract_dup(m, sources, staging)
                         continue
-                    try:
-                        tf.extract(m, staging, filter="data")
-                    except tarfile.FilterError as e:
-                        raise CorruptFileError(f"unsafe entry in archive: {e}") from e
+                    path = _extract_one(tf, m, staging)
+                    if is_src:
+                        sources[m.name] = path
         except tarfile.TarError as e:
             raise CorruptFileError(f"archive is malformed: {e}") from e
         _drain(stream)
@@ -442,3 +576,5 @@ def extract(stream, dest: Path, force: bool = False, before_commit: Callable[[],
         return _commit_merge(staging, dest, force)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+        if stash is not None:
+            shutil.rmtree(stash, ignore_errors=True)

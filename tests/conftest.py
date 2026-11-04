@@ -7,6 +7,12 @@ from crunchlock import api
 FAST = "insecure-test"
 
 
+@pytest.fixture(autouse=True)
+def _own_config_dir(tmp_path, monkeypatch):
+    """Never read or write the real user's settings/contacts during tests."""
+    monkeypatch.setenv("CRUNCHLOCK_CONFIG_DIR", str(tmp_path / "config"))
+
+
 @pytest.fixture
 def sample(tmp_path):
     src = tmp_path / "docs"

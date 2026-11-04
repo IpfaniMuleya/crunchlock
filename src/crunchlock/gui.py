@@ -26,7 +26,7 @@ try:
 except Exception:  # noqa: BLE001 - drag and drop is optional
     TkinterDnD = None
 
-from . import __version__, api, instance, kdf, keys, passgen, update
+from . import __version__, api, contacts, instance, kdf, keys, passgen, update
 from .settings import Settings
 from .cli import human
 from .errors import CancelledError, CrunchlockError, WrongKeyError
@@ -434,8 +434,33 @@ class RecipientList(ttk.Frame):
         rb = ttk.Frame(self)
         rb.pack(side="left", anchor="n")
         ttk.Button(rb, text="Add public key…", command=self.add).pack(fill="x")
+        ttk.Button(rb, text="From contacts…", command=self.from_contacts).pack(fill="x", pady=(6, 0))
         ttk.Button(rb, text="Remove", command=self.remove).pack(fill="x", pady=(6, 0))
         self.paths: dict[str, str] = {}
+
+    def from_contacts(self):
+        people = contacts.load()
+        if not people:
+            messagebox.showinfo("No contacts yet", "Add people's public keys under "
+                                "Passphrases & keys → Contacts first.", parent=self)
+            return
+        win = tk.Toplevel(self)
+        win.title("Choose contacts")
+        win.transient(self.winfo_toplevel())
+        lb = tk.Listbox(win, selectmode="extended", height=min(12, len(people)), width=40)
+        for name in people:
+            lb.insert("end", name)
+        lb.pack(fill="both", expand=True, padx=GAP, pady=GAP)
+
+        def ok():
+            for i in lb.curselection():
+                name = lb.get(i)
+                if people[name] not in self.paths.values():
+                    pub = api.load_recipient(people[name])
+                    iid = self.tree.insert("", "end", text=f"👤 {name}  ({keys.fingerprint(pub)})")
+                    self.paths[iid] = people[name]
+            win.destroy()
+        ttk.Button(win, text="Add", style="Accent.TButton", command=ok).pack(pady=(0, GAP))
 
     def add(self):
         for p in filedialog.askopenfilenames(title="Recipient public keys",
@@ -931,7 +956,7 @@ class UnlockTab(ScrollFrame):
         sigc.pack(fill="x", pady=(0, GAP))
         sc = card(sigc.content, "Expected sender", "optional")
         self.signer = tk.StringVar()
-        labeled_entry(sc, 0, "Their public key", self.signer,
+        labeled_entry(sc, 0, "Key or contact", self.signer,
                       lambda: self.signer.set(filedialog.askopenfilename(
                           title="The sender's public key",
                           filetypes=[("Crunchlock public key", "*.clkpub"), ("All files", "*")])
@@ -1302,10 +1327,12 @@ class UnlockTab(ScrollFrame):
         self.idpw.clear()
         repaired = (f"\nRepaired {result.repaired_bytes} damaged bytes using the recovery data."
                     if result.repaired_bytes else "")
-        if result.signed_by:
+        if result.signed_by and result.signer_name:
+            repaired += f"\n✓ Signed by {result.signer_name} ({result.signed_by})"
+        elif result.signed_by:
             repaired += (f"\n✓ Signed by the expected sender ({result.signed_by})" if signer else
-                         f"\nSigned by key {result.signed_by} (compare it with the sender's "
-                         "signing fingerprint)")
+                         f"\nSigned by key {result.signed_by} (not in your contacts; compare it "
+                         "with the sender's signing fingerprint)")
         else:
             repaired += "\nNot signed."
         if verify:
@@ -1357,6 +1384,17 @@ class ToolsTab(ScrollFrame):
         ttk.Button(self.pub_row, text="Copy public key",
                    command=lambda: self.clipboard_put(self.pub.get())).pack(side="left", padx=(8, 0))
 
+        ct = card(b, "Contacts", "people's public keys, saved under a name")
+        self.contact_tree = ttk.Treeview(ct, show="tree", height=3)
+        self.contact_tree.pack(fill="x")
+        cb = ttk.Frame(ct)
+        cb.pack(fill="x", pady=(8, 0))
+        ttk.Button(cb, text="Add…", command=self.add_contact).pack(side="left")
+        ttk.Button(cb, text="Remove", command=self.remove_contact).pack(side="left", padx=8)
+        ttk.Label(cb, text="Pick them as recipients, and see “Signed by <name>” when unlocking.",
+                  style="Muted.TLabel").pack(side="left", padx=(8, 0))
+        self.refresh_contacts()
+
         st = card(b, "App settings", "your choices are remembered between sessions")
         ttk.Label(st, style="Card.TLabel", justify="left", wraplength=640, text=(
             "Crunchlock remembers options like compression, theme, recovery data and folders, "
@@ -1389,6 +1427,37 @@ class ToolsTab(ScrollFrame):
             "the data cannot be recovered."
         )).pack(fill="x")
         self.gen()
+
+    def refresh_contacts(self):
+        self.contact_tree.delete(*self.contact_tree.get_children())
+        for name, text in contacts.load().items():
+            x, ed = keys.parse_public_text(text)
+            extra = f"   signs as {keys.fingerprint(ed)}" if ed else "   (old key: can't check signatures)"
+            self.contact_tree.insert("", "end", iid=name, text=f"👤 {name}   {keys.fingerprint(x)}{extra}")
+
+    def add_contact(self):
+        p = filedialog.askopenfilename(title="Their public key", parent=self, filetypes=[
+            ("Crunchlock public key", "*.clkpub"), ("All files", "*")])
+        if not p:
+            return
+        name = simpledialog.askstring("Contact name", "Name for this person:",
+                                      initialvalue=Path(p).stem, parent=self)
+        if not name:
+            return
+        try:
+            contacts.add(name, Path(p).read_text("utf-8"))
+        except (CrunchlockError, OSError) as e:
+            messagebox.showerror("Can't add contact", str(e), parent=self)
+            return
+        self.refresh_contacts()
+
+    def remove_contact(self):
+        for name in self.contact_tree.selection():
+            try:
+                contacts.remove(name)
+            except CrunchlockError:
+                pass
+        self.refresh_contacts()
 
     def _save_update_choice(self):
         self.app.settings.set("check_updates", bool(self.check_updates.get()))

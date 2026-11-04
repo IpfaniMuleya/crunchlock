@@ -1,20 +1,23 @@
 """High-level API: lock / unlock / verify / info."""
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 
-from . import archive, compress, kdf, keys, recovery
+from . import archive, compress, contacts, kdf, keys, recovery
 from .crypto import DecryptReader, EncryptWriter
 from . import jpeg as jpeg_codec
 from . import png as png_codec
 from .crypto import reencrypt
 from .errors import CancelledError, CorruptFileError, CrunchlockError, WrongKeyError  # noqa: F401 (re-export)
-from .format import FLAG_JPEG_XL, FLAG_PNG, FLAG_SIGNED, Header, PasswordSlot, X25519Slot, read_header
+from .format import FLAG_DEDUP, FLAG_JPEG_XL, FLAG_PNG, FLAG_SIGNED, Header, PasswordSlot, X25519Slot, read_header
 from .shred import shred
 from .split import MultiReader, OutputSink, resolve_parts
 
@@ -53,6 +56,7 @@ class UnlockResult:
     compression: str
     repaired_bytes: int = 0
     signed_by: str | None = None  # fingerprint of the key that signed it, if signed
+    signer_name: str | None = None  # the contact it belongs to, if known
 
 
 @dataclass
@@ -61,6 +65,7 @@ class VerifyResult:
     compression: str
     repaired_bytes: int = 0
     signed_by: str | None = None
+    signer_name: str | None = None
 
     @property
     def total_bytes(self) -> int:
@@ -166,7 +171,7 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
          pad: bool = False, recovery_data: bool = False, split_size: int | None = None,
          shred_originals: bool = False, force: bool = False, jpeg: bool = True,
          png: bool = True, long_range: bool = False, sign_with: keys.Identity | None = None,
-         progress: Progress = None) -> LockResult:
+         dedup: bool = True, progress: Progress = None) -> LockResult:
     """Compress (optionally) and encrypt *paths* into one ``.clk`` file (or parts).
 
     compression: "zstd" (default), "xz", "best" (tries both, keeps the smaller) or "none".
@@ -177,6 +182,7 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
     unlocking then needs up to 1 GiB of memory. The window always grows to 128 MiB
     for big inputs.
     sign_with: your key pair; recipients can check the file came from you.
+    dedup: store identical files once (restored as normal, separate copies).
 
     *progress* may raise CancelledError to abort; partial output is removed.
     """
@@ -216,7 +222,8 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
     total = archive.total_size(paths)
     common = dict(password=password, keyfile=keyfile, recipients=recipients, params=params,
                   pad=pad, recovery_data=recovery_data, split_size=split_size, force=force,
-                  flags=(FLAG_JPEG_XL if use_jpeg else 0) | (FLAG_PNG if use_png else 0),
+                  flags=(FLAG_JPEG_XL if use_jpeg else 0) | (FLAG_PNG if use_png else 0)
+                  | (FLAG_DEDUP if dedup else 0),
                   sign_with=sign_with, size_hint=total, long_range=long_range)
     pipes: list[_Pipeline] = []
     try:
@@ -236,7 +243,8 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
 
         stats = archive.PackStats()
         warnings = archive.pack(paths, pipes[0] if len(pipes) == 1 else _Tee(pipes), cb,
-                                jpeg_recompress=use_jpeg, stats=stats, png_recompress=use_png)
+                                jpeg_recompress=use_jpeg, stats=stats, png_recompress=use_png,
+                                dedup=dedup)
         for pipe in pipes:
             pipe.finish()
         best = min(pipes, key=lambda pp: pp.sink.total)
@@ -260,6 +268,10 @@ def lock(paths: Iterable[str | Path], output: str | Path | None = None, *,
     if stats.png_files:
         png_note = f"{stats.png_files} PNG image(s) repacked losslessly"
         note = f"{note}; {png_note}" if note else png_note
+    if stats.dup_files:
+        dup_note = (f"{stats.dup_files} duplicate file(s) stored once, saving "
+                    f"{stats.dup_saved / 1048576:.1f} MB")
+        note = f"{note}; {dup_note}" if note else dup_note
     result = LockResult(outputs, total, best.sink.total, compress.NAMES[best.algo], note,
                         warnings=warnings, jpeg_files=stats.jpeg_files, jpeg_saved=stats.jpeg_saved,
                         png_files=stats.png_files,
@@ -365,6 +377,10 @@ def _signed_by(dec: DecryptReader) -> str | None:
     return keys.fingerprint(dec.signer) if dec.signer else None
 
 
+def _signer_name(dec: DecryptReader) -> str | None:
+    return contacts.name_for_verify_key(dec.signer) if dec.signer else None
+
+
 def _open_and_verify(parts, **kw) -> VerifyResult:
     decomp, finish, rs, mr, dec = _open(parts, **kw)
     try:
@@ -373,7 +389,7 @@ def _open_and_verify(parts, **kw) -> VerifyResult:
     finally:
         mr.close()
     return VerifyResult(entries, compress.NAMES[decomp.algo], rs.corrected_bytes if rs else 0,
-                        _signed_by(dec))
+                        _signed_by(dec), _signer_name(dec))
 
 
 def verify(path: str | Path, *, password=None, keyfile=None, identity=None, signer=None,
@@ -402,7 +418,7 @@ def unlock(path: str | Path, dest: str | Path | None = None, *, password=None, k
     finally:
         mr.close()
     return UnlockResult(extracted, compress.NAMES[decomp.algo], rs.corrected_bytes if rs else 0,
-                        _signed_by(dec))
+                        _signed_by(dec), _signer_name(dec))
 
 
 @dataclass
@@ -593,10 +609,16 @@ def load_identity(path: str | Path, passphrase: str) -> keys.Identity:
 
 
 def _public_text(text_or_path: str) -> str:
+    """A public key given as clkpub text, a .clkpub file or a contact's name."""
     text = text_or_path.strip()
-    if not text.startswith((keys.PUB_PREFIX, keys.PUB2_PREFIX)) and Path(text).exists():
-        text = Path(text).read_text("utf-8")
-    return text
+    if text.startswith((keys.PUB_PREFIX, keys.PUB2_PREFIX)):
+        return text
+    if Path(text).exists():
+        return Path(text).read_text("utf-8")
+    found = contacts.find(text)
+    if found is None:
+        raise CrunchlockError(f"{text!r} is not a public key, a .clkpub file or a contact name")
+    return found
 
 
 def load_recipient(text_or_path: str) -> X25519PublicKey:
@@ -606,6 +628,56 @@ def load_recipient(text_or_path: str) -> X25519PublicKey:
 def load_verify_key(text_or_path: str):
     """The signature-check key from a clkpub2 public key (text or .clkpub file)."""
     return keys.verify_key_from_text(_public_text(text_or_path))
+
+
+# ---------------------------------------------------- signatures of any file
+
+SIG_FILE_MAGIC = b"CLKSIG1\n"
+_FILE_SIG_CONTEXT = b"crunchlock file signature v1\x00"
+
+
+@dataclass
+class FileSignature:
+    signed_by: str
+    signer_name: str | None
+
+
+def _file_digest(path: Path) -> bytes:
+    h = hashlib.sha512()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.digest()
+
+
+def sign_file(path: str | Path, identity: keys.Identity, output: str | Path | None = None) -> Path:
+    """Write ``<file>.clksig``: proves *identity* signed this exact file."""
+    path = Path(path)
+    out = Path(output) if output else path.with_name(path.name + ".clksig")
+    sig = identity.signing_key.sign(_FILE_SIG_CONTEXT + _file_digest(path))
+    out.write_bytes(SIG_FILE_MAGIC + identity.verify_key.public_bytes_raw() + sig)
+    return out
+
+
+def verify_file(path: str | Path, signature: str | Path | None = None, *,
+                signer=None) -> FileSignature:
+    """Check a .clksig. Raises CorruptFileError if the file changed or the signature is bad,
+    CrunchlockError if *signer* is given and someone else signed it."""
+    path = Path(path)
+    data = Path(signature or path.with_name(path.name + ".clksig")).read_bytes()
+    if len(data) != len(SIG_FILE_MAGIC) + 96 or not data.startswith(SIG_FILE_MAGIC):
+        raise CorruptFileError("not a crunchlock signature file")
+    pub, sig = data[len(SIG_FILE_MAGIC):-64], data[-64:]
+    try:
+        Ed25519PublicKey.from_public_bytes(pub).verify(sig, _FILE_SIG_CONTEXT + _file_digest(path))
+    except (InvalidSignature, ValueError):
+        raise CorruptFileError("the signature does not match: the file was changed or the "
+                               "signature is forged") from None
+    expected = _expected_signer(signer)
+    if expected is not None and expected != pub:
+        raise CrunchlockError(f"signed by {keys.fingerprint(pub)}, not by the expected "
+                              f"{keys.fingerprint(expected)}")
+    return FileSignature(keys.fingerprint(pub), contacts.name_for_verify_key(pub))
 
 
 # ---------------------------------------------------------------- add files
@@ -704,7 +776,7 @@ def add(path: str | Path, items: Iterable[str | Path], *, password: str | None =
         use_jpeg = jpeg and jpeg_codec.AVAILABLE and algo != compress.NONE
         use_png = png and png_codec.available() and algo != compress.NONE
         flags = (header.flags & ~FLAG_SIGNED) | (FLAG_JPEG_XL if use_jpeg else 0) \
-            | (FLAG_PNG if use_png else 0)
+            | (FLAG_PNG if use_png else 0) | FLAG_DEDUP
         params = pw_slots[0].params if pw_slots else kdf.PROFILES["standard"]
         pipe = _Pipeline(base, algo, None, password=password if pw_slots else None,
                          keyfile=keyfile if pw_slots else None, recipients=recipients,
@@ -719,7 +791,7 @@ def add(path: str | Path, items: Iterable[str | Path], *, password: str | None =
 
         stats = archive.PackStats()
         warnings = archive.pack(new_paths, pipe, new_cb, jpeg_recompress=use_jpeg, stats=stats,
-                                png_recompress=use_png, prelude=prelude)
+                                png_recompress=use_png, prelude=prelude, dedup=True)
         # The old file must be fully authentic before anything replaces it.
         if dec.read(1):
             raise CorruptFileError("unexpected data after the end of the compressed stream")

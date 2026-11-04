@@ -152,8 +152,10 @@ def _secrets_for_open(a):
     return password, keyfile, identity
 
 
-def _print_signer(signed_by, expected) -> None:
-    if signed_by:
+def _print_signer(signed_by, expected, name=None) -> None:
+    if signed_by and name:
+        print(f"  signed by {name} (key {signed_by})" + ("  (matches --signer)" if expected else ""))
+    elif signed_by:
         print(f"  signed by key {signed_by}" + ("  (matches --signer)" if expected else
                                                  "  (compare this with the sender's fingerprint)"))
     else:
@@ -170,7 +172,7 @@ def cmd_unlock(a) -> int:
         print(f"  repaired {r.repaired_bytes} damaged bytes using recovery data")
     for p in r.extracted:
         print(f"extracted {p}")
-    _print_signer(r.signed_by, a.signer)
+    _print_signer(r.signed_by, a.signer, r.signer_name)
     return 0
 
 
@@ -183,7 +185,7 @@ def cmd_verify(a) -> int:
     files = [e for e in r.entries if not e[2]]
     print(f"OK: authentic and intact — {len(files)} file(s), {human(r.total_bytes)} "
           f"[compression: {r.compression}]")
-    _print_signer(r.signed_by, a.signer)
+    _print_signer(r.signed_by, a.signer, r.signer_name)
     if r.repaired_bytes:
         print(f"  warning: {r.repaired_bytes} damaged bytes were repaired in memory; "
               "consider re-locking a fresh copy")
@@ -234,6 +236,47 @@ def cmd_pubkey(a) -> int:
     print(text)
     print(f"  fingerprint          {keys.fingerprint(ident.public)}")
     print(f"  signing fingerprint  {keys.fingerprint(ident.verify_key)}")
+    return 0
+
+
+def cmd_contacts(a) -> int:
+    from . import contacts
+    if a.action == "add":
+        if not a.name or not a.key:
+            raise CrunchlockError("usage: crunchlock contacts add NAME PUBLIC_KEY_OR_FILE")
+        text = a.key if a.key.startswith((keys.PUB_PREFIX, keys.PUB2_PREFIX)) \
+            else Path(a.key).read_text("utf-8")
+        contacts.add(a.name, text)
+        print(f"added {a.name}")
+    elif a.action == "remove":
+        if not a.name:
+            raise CrunchlockError("usage: crunchlock contacts remove NAME")
+        contacts.remove(a.name)
+        print(f"removed {a.name}")
+    else:
+        data = contacts.load()
+        if not data:
+            print("no contacts yet (crunchlock contacts add NAME bob.clkpub)")
+        for name, text in data.items():
+            x, ed = keys.parse_public_text(text)
+            sig = f"  signs as {keys.fingerprint(ed)}" if ed else "  (old key: can't check signatures)"
+            print(f"{name}\t{keys.fingerprint(x)}{sig}")
+    return 0
+
+
+def cmd_sign_file(a) -> int:
+    pw = os.environ.get(ENV_PASSWORD + "_KEY") or \
+        ask_password(False, "Private key passphrase: ", allow_env=False)  # env var: for CI
+    ident = api.load_identity(a.key, pw)
+    out = api.sign_file(a.file, ident)
+    print(f"wrote {out}  (signed by {keys.fingerprint(ident.verify_key)})")
+    return 0
+
+
+def cmd_verify_file(a) -> int:
+    r = api.verify_file(a.file, a.signature, signer=a.signer)
+    who = f"{r.signer_name} (key {r.signed_by})" if r.signer_name else f"key {r.signed_by}"
+    print(f"OK: {a.file} is unchanged and was signed by {who}")
     return 0
 
 
@@ -461,6 +504,24 @@ def build_parser() -> argparse.ArgumentParser:
     pk.add_argument("-o", "--output", help="save it to this .clkpub file")
     pk.add_argument("-f", "--force", action="store_true")
     pk.set_defaults(func=cmd_pubkey)
+
+    ct = sub.add_parser("contacts", help="save people's public keys under a name "
+                                         "(then use the name with -r / --signer)")
+    ct.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove"])
+    ct.add_argument("name", nargs="?")
+    ct.add_argument("key", nargs="?", help="public key text or .clkpub file (for add)")
+    ct.set_defaults(func=cmd_contacts)
+
+    sf = sub.add_parser("sign-file", help="sign any file (writes FILE.clksig)")
+    sf.add_argument("file")
+    sf.add_argument("--key", required=True, help="your private key (.clkkey)")
+    sf.set_defaults(func=cmd_sign_file)
+    vfl = sub.add_parser("verify-file", help="check a FILE.clksig signature (e.g. a download)")
+    vfl.add_argument("file")
+    vfl.add_argument("--signature", help="signature file (default: FILE.clksig)")
+    vfl.add_argument("--signer", metavar="PUBKEY",
+                     help="only accept this signer (public key, .clkpub file or contact name)")
+    vfl.set_defaults(func=cmd_verify_file)
 
     cu = sub.add_parser("check-update", help="see if a newer version is out (contacts github.com)")
     cu.set_defaults(func=cmd_check_update)
