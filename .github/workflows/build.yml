@@ -171,4 +171,5 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
-          generate_release_notes: true
+          # Only attach files: release notes are written (or generated) when the
+          # release is published in the GitHub UI, so don't add a second copy.
