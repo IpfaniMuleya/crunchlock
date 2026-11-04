@@ -1,0 +1,134 @@
+name: Test & build executables
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      EXE: ${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install . pyinstaller pillow
+      - name: Build executables
+        run: python packaging/build.py
+      - name: Smoke test (lock -> verify -> change password -> unlock round trip)
+        env:
+          CRUNCHLOCK_PASSWORD: ci-smoke-test-passphrase
+        run: |
+          mkdir -p smoke/in
+          seq 1 100000 > smoke/in/numbers.txt
+          cp README.md smoke/in/
+          python -c "from PIL import Image; import random; im = Image.effect_mandelbrot((800, 600), (-2, -1.2, 1, 1.2), 100).convert('RGB'); im.save('smoke/in/photo.jpg', quality=90)"
+          ./dist/crunchlock$EXE genpass
+          ./dist/crunchlock$EXE lock smoke/in -o smoke/t.clk -c best --recovery --pad --split 64K | tee smoke/lock.log
+          grep -q "JPEG photo(s) recompressed losslessly" smoke/lock.log
+          ./dist/crunchlock$EXE verify smoke/t.clk.001 -q
+          CRUNCHLOCK_PASSWORD_NEW=ci-new-passphrase ./dist/crunchlock$EXE rekey smoke/t.clk.001 -q
+          if ./dist/crunchlock$EXE verify smoke/t.clk.001 -q; then echo "old password still works"; exit 1; fi
+          CRUNCHLOCK_PASSWORD=ci-new-passphrase ./dist/crunchlock$EXE unlock smoke/t.clk.001 -o smoke/out -q
+          diff -r smoke/in smoke/out/in
+          echo "round trip OK"
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $inno = "${env:ProgramFiles(x86)}\Inno Setup 6"
+          if (-not (Test-Path "$inno\ISCC.exe")) { choco install innosetup --no-progress -y }
+          $ver = python -c "import crunchlock; print(crunchlock.__version__)"
+          & "$inno\ISCC.exe" "/DAppVersion=$ver" "/DDistDir=$PWD\dist" "/DIconFile=$PWD\build\icons\crunchlock.ico" packaging\windows\crunchlock.iss
+          if ($LASTEXITCODE) { throw "ISCC failed" }
+      - name: Test installer (install, check, uninstall)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist\Crunchlock-Setup-*.exe | Select-Object -First 1
+          Start-Process $setup.FullName -Wait -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/TASKS=contextmenu,association'
+          $app = "$env:LOCALAPPDATA\Programs\Crunchlock"
+          if (-not (Test-Path "$app\CrunchlockGUI.exe")) { throw "app not installed in $app" }
+          & "$app\crunchlock.exe" genpass
+          if ($LASTEXITCODE) { throw "installed CLI failed" }
+          $open = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Classes\Crunchlock.LockedFile\shell\open\command').'(default)'
+          $ctx = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Classes\*\shell\Crunchlock\command').'(default)'
+          $dir = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Classes\Directory\shell\Crunchlock\command').'(default)'
+          foreach ($c in @($open, $ctx, $dir)) { if ($c -notlike '*CrunchlockGUI.exe*%1*') { throw "bad shell command: $c" } }
+          Write-Host "installed OK: $open"
+          Start-Process "$app\unins000.exe" -Wait -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          for ($i = 0; $i -lt 30 -and (Test-Path "$app\CrunchlockGUI.exe"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$app\CrunchlockGUI.exe") { throw "uninstall left files behind" }
+          if (Test-Path -LiteralPath 'HKCU:\Software\Classes\*\shell\Crunchlock') { throw "uninstall left the context menu" }
+          if (Test-Path -LiteralPath 'HKCU:\Software\Classes\Crunchlock.LockedFile') { throw "uninstall left the file association" }
+          Write-Host "uninstalled cleanly"
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: crunchlock-Windows-installer
+          path: dist/Crunchlock-Setup-*.exe
+          if-no-files-found: error
+      - name: Package
+        run: |
+          name=crunchlock-${{ runner.os }}-${{ runner.arch }}
+          mkdir -p package
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "../package/$name.zip" crunchlock.exe CrunchlockGUI.exe
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            tar czf "../package/$name.tar.gz" crunchlock CrunchlockGUI.app
+          else
+            tar czf "../package/$name.tar.gz" crunchlock CrunchlockGUI
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crunchlock-${{ runner.os }}
+          path: package/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
