@@ -2,7 +2,7 @@
 ; Built in CI by:  iscc /DAppVersion=1.2.3 /DDistDir=..\..\dist /DIconFile=..\..\build\icons\crunchlock.ico packaging\windows\crunchlock.iss
 
 #ifndef AppVersion
-  #define AppVersion "1.0.3"
+  #define AppVersion "1.0.4"
 #endif
 #ifndef DistDir
   #define DistDir "..\..\dist"
