@@ -32,7 +32,7 @@ jobs:
       run:
         shell: bash
     env:
-      EXE: ${{ runner.os == 'Windows' && '.exe' || '' }}
+      EXE: ${{ matrix.os == 'windows-latest' && '.exe' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

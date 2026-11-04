@@ -46,20 +46,30 @@ The programs aren't code-signed. Windows SmartScreen may show "Windows protected
 click *More info → Run anyway*. On macOS, right-click the app and choose *Open* the first
 time.
 
-To build them yourself, run this on the target OS:
+## Run it on your computer (from the source code)
+
+First install **Python 3.10 or newer**. On Windows, get it from
+[python.org](https://www.python.org/downloads/) and tick **"Add python.exe to PATH"** in the
+installer. Then open a terminal in the `crunchlock` folder (the one containing
+`pyproject.toml`).
+
+**Option A: run it directly**
 
 ```bash
-pip install . pyinstaller
-python packaging/build.py      # -> dist/
+py -m pip install .        # Windows   (macOS/Linux: python3 -m pip install .)
+crunchlock-gui             # desktop app
+crunchlock --help          # command-line tool
 ```
 
-## Install from source
+If `crunchlock-gui` isn't found, run `py -m crunchlock.gui` instead (or `python3 -m crunchlock.gui`).
+On Debian/Ubuntu, install Tkinter first: `sudo apt install python3-tk`.
 
-```bash
-pip install .            # Python 3.10+
-```
+**Option B: build your own .exe**
 
-The GUI uses Tkinter. On Debian/Ubuntu: `sudo apt install python3-tk`.
+- On Windows, double-click `packaging\build_windows.bat`. It sets everything up and opens the
+  `dist` folder containing `CrunchlockGUI.exe` and `crunchlock.exe`.
+- On any OS, you can instead run `pip install . pyinstaller` and then
+  `python packaging/build.py`. The programs are written to `dist/`.
 
 ## Command line
 
