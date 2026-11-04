@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from . import __version__, api, compress, kdf, keys, passgen
+from .eta import Eta, format_eta
 from .errors import CrunchlockError, WrongKeyError
 from .shred import WARNING as SHRED_WARNING
 from .split import parse_size
@@ -29,21 +30,23 @@ class ProgressPrinter:
         self.enabled = enabled and sys.stderr.isatty()
         self.last = 0.0
         self.stage = None
+        self.eta = Eta()
 
     def __call__(self, stage: str, done: int, total: int) -> None:
         if not self.enabled:
             return
+        left = format_eta(self.eta.update(stage, done, total))
         now = time.monotonic()
         if stage == self.stage and now - self.last < 0.1 and done < total:
             return
         self.last, self.stage = now, stage
         pct = f"{100 * done / total:5.1f}%" if total else ""
-        sys.stderr.write(f"\r  {stage:<14} {pct} {human(done):>10}   ")
+        sys.stderr.write(f"\r  {stage:<14} {pct} {human(done):>10}   {left:<22}")
         sys.stderr.flush()
 
     def done(self) -> None:
         if self.enabled:
-            sys.stderr.write("\r" + " " * 50 + "\r")
+            sys.stderr.write("\r" + " " * 72 + "\r")
 
 
 def read_keyfile(path: str | None) -> bytes | None:
@@ -86,12 +89,26 @@ def cmd_lock(a) -> int:
         print(f"  note: {SHRED_WARNING}", file=sys.stderr)
     split = parse_size(a.split) if a.split else None
     prog = ProgressPrinter(not a.quiet)
-    r = api.lock(a.paths, a.output, password=password or None, keyfile=keyfile,
-                 recipients=recipients, compression="none" if a.no_compress else a.compress,
-                 level=a.level, kdf_profile=a.profile, pad=a.pad, recovery_data=a.recovery,
-                 split_size=split, shred_originals=a.shred, force=a.force, jpeg=not a.no_jpeg,
-                 progress=prog)
+    options = dict(password=password or None, keyfile=keyfile,
+                   recipients=recipients, compression="none" if a.no_compress else a.compress,
+                   level=a.level, kdf_profile=a.profile, pad=a.pad, recovery_data=a.recovery,
+                   split_size=split, shred_originals=a.shred, force=a.force, jpeg=not a.no_jpeg)
+    if a.each:
+        results = api.lock_each(a.paths, a.output, progress=prog, **options)
+        prog.done()
+        for r in results:
+            _print_lock_result(r)
+        total_in = sum(r.input_bytes for r in results)
+        total_out = sum(r.output_bytes for r in results)
+        print(f"locked {len(results)} item(s) separately: {human(total_in)} -> {human(total_out)}")
+        return 0
+    r = api.lock(a.paths, a.output, progress=prog, **options)
     prog.done()
+    _print_lock_result(r)
+    return 0
+
+
+def _print_lock_result(r) -> None:
     for o in r.outputs:
         print(f"wrote {o}")
     print(f"  {human(r.input_bytes)} -> {human(r.output_bytes)}"
@@ -103,7 +120,6 @@ def cmd_lock(a) -> int:
         print(f"  warning: {w}", file=sys.stderr)
     for s in r.shredded:
         print(f"  securely deleted {s}")
-    return 0
 
 
 def _identity(a):
@@ -131,7 +147,7 @@ def cmd_unlock(a) -> int:
     password, keyfile, identity = _secrets_for_open(a)
     prog = ProgressPrinter(not a.quiet)
     r = api.unlock(a.file, a.output, password=password, keyfile=keyfile, identity=identity,
-                   force=a.force, progress=prog)
+                   force=a.force, only=a.only, progress=prog)
     prog.done()
     if r.repaired_bytes:
         print(f"  repaired {r.repaired_bytes} damaged bytes using recovery data")
@@ -177,6 +193,33 @@ def cmd_rekey(a) -> int:
     prog.done()
     print(f"updated {', '.join(str(o) for o in r.outputs)}")
     print(f"  now opens with: {r.unlock_with}")
+    return 0
+
+
+def cmd_list(a) -> int:
+    password, keyfile, identity = _secrets_for_open(a)
+    prog = ProgressPrinter(not a.quiet)
+    r = api.verify(a.file, password=password, keyfile=keyfile, identity=identity, progress=prog)
+    prog.done()
+    for name, size, is_dir in r.entries:
+        print(f"{name}/" if is_dir else f"{name}\t{human(size)}")
+    files = [e for e in r.entries if not e[2]]
+    print(f"  {len(files)} file(s), {human(r.total_bytes)}; extract some with: "
+          f"crunchlock unlock {a.file} --only <path>", file=sys.stderr)
+    return 0
+
+
+def cmd_repair(a) -> int:
+    prog = ProgressPrinter(not a.quiet)
+    r = api.repair(a.file, a.output, force=a.force, progress=prog)
+    prog.done()
+    if not r.was_damaged:
+        print("no damage found; nothing written")
+        return 0
+    print(f"repaired {r.repaired_bytes} damaged bytes")
+    for o in r.outputs:
+        print(f"wrote {o}")
+    print("  check it with: crunchlock verify " + str(r.outputs[0]))
     return 0
 
 
@@ -233,7 +276,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     lk = sub.add_parser("lock", help="compress + encrypt files/folders into a .clk file")
     lk.add_argument("paths", nargs="+", help="files and/or folders")
-    lk.add_argument("-o", "--output", help="output file (default: <first-input>.clk)")
+    lk.add_argument("-o", "--output",
+                    help="output file (default: <first-input>.clk); with --each, a folder")
+    lk.add_argument("--each", action="store_true",
+                    help="lock every file/folder into its own .clk instead of one bundle")
     g = lk.add_mutually_exclusive_group()
     g.add_argument("-n", "--no-compress", action="store_true", help="encrypt only, don't compress")
     g.add_argument("-c", "--compress", default="zstd", choices=["zstd", "xz", "best"],
@@ -272,6 +318,16 @@ def build_parser() -> argparse.ArgumentParser:
     ul = opener("unlock", "decrypt + decompress a .clk file", cmd_unlock)
     ul.add_argument("-o", "--output", help="folder to extract into (default: next to the file)")
     ul.add_argument("-f", "--force", action="store_true", help="overwrite existing files")
+    ul.add_argument("--only", action="append", metavar="PATH",
+                    help="extract just this file or folder (as shown by `crunchlock list`); repeatable")
+    opener("list", "show the files inside a .clk (needs the password)", cmd_list)
+    rp = sub.add_parser("repair", help="write a repaired copy of a damaged file (needs recovery data; "
+                                      "no password needed)")
+    rp.add_argument("file", help=".clk file (or its .001 part)")
+    rp.add_argument("-o", "--output", help="output file (default: <name>.repaired.clk)")
+    rp.add_argument("-f", "--force", action="store_true", help="overwrite existing output")
+    rp.add_argument("-q", "--quiet", action="store_true")
+    rp.set_defaults(func=cmd_repair)
     vf = opener("verify", "check password and integrity without extracting", cmd_verify)
     vf.add_argument("--list", action="store_true", help="list contents")
 
