@@ -1,0 +1,15 @@
+# Exact versions used for the release builds in CI (keep local builds identical).
+# Install with:  pip install -r packaging/requirements-build.txt
+argon2-cffi==25.1.0
+argon2-cffi-bindings==26.1.0
+cffi==2.1.1
+cryptography==50.0.2
+imagecodecs==2026.10.10
+numpy==2.5.4
+reedsolo==1.7.0
+sv-ttk==2.6.1
+tkinterdnd2==0.7.0
+zstandard==0.25.0
+pillow==13.0.0
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9

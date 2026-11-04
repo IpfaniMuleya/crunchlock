@@ -42,10 +42,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install
-        run: pip install . pyinstaller pillow
-      - name: Build executables
-        run: python packaging/build.py
+      - name: Install (exact pinned build versions)
+        run: |
+          pip install -r packaging/requirements-build.txt
+          pip install --no-deps .
+      - name: Install a virtual display (Linux GUI self-test)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q xvfb
+      - name: Build executables and self-test both (CLI + GUI)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a python packaging/build.py
+          else
+            python packaging/build.py
+          fi
       - name: Smoke test (lock -> verify -> change password -> unlock round trip)
         env:
           CRUNCHLOCK_PASSWORD: ci-smoke-test-passphrase
@@ -87,6 +97,10 @@ jobs:
           $dir = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Classes\Directory\shell\Crunchlock\command').'(default)'
           foreach ($c in @($open, $ctx, $dir)) { if ($c -notlike '*CrunchlockGUI.exe*%1*') { throw "bad shell command: $c" } }
           Write-Host "installed OK: $open"
+          $result = Join-Path $env:RUNNER_TEMP "installed-selftest.txt"
+          $p = Start-Process "$app\CrunchlockGUI.exe" -ArgumentList '--self-test', $result -Wait -PassThru
+          Get-Content $result
+          if ($p.ExitCode -ne 0) { throw "installed CrunchlockGUI.exe failed its self-test" }
           Start-Process "$app\unins000.exe" -Wait -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
           for ($i = 0; $i -lt 30 -and (Test-Path "$app\CrunchlockGUI.exe"); $i++) { Start-Sleep 1 }
           if (Test-Path "$app\CrunchlockGUI.exe") { throw "uninstall left files behind" }

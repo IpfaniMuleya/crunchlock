@@ -78,10 +78,23 @@ On Debian/Ubuntu, install Tkinter first: `sudo apt install python3-tk`.
 
 **Option B: build your own .exe**
 
-- On Windows, double-click `packaging\build_windows.bat`. It sets everything up and opens the
-  `dist` folder containing `CrunchlockGUI.exe` and `crunchlock.exe`.
-- On any OS, you can instead run `pip install . pyinstaller` and then
-  `python packaging/build.py`. The programs are written to `dist/`.
+- On Windows, double-click `packaging\build_windows.bat`. It creates a fresh private
+  environment with **exactly the package versions used for the official release**, builds the
+  programs, **self-tests both**, and opens the `dist` folder containing `CrunchlockGUI.exe` and
+  `crunchlock.exe`. Python 3.12 is recommended.
+- On any OS, you can instead run these:
+  ```bash
+  pip install -r packaging/requirements-build.txt
+  pip install --no-deps .
+  python packaging/build.py
+  ```
+  The programs are written to `dist/`. On a Linux machine without a display, use
+  `xvfb-run python packaging/build.py`.
+
+If the build stops with **"BUILD FAILED THE SELF-TEST"**, the error shown above that line is
+the real cause; please report it. To check any copy of the app, run
+`CrunchlockGUI --self-test result.txt` (or `crunchlock --self-test`). It loads every library the
+app needs and does a lock/verify/unlock round trip; `result.txt` ends with `OK` if it all works.
 
 ## Command line
 
