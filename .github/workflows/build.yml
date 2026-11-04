@@ -1,0 +1,90 @@
+name: Test & build executables
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      EXE: ${{ runner.os == 'Windows' && '.exe' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install . pyinstaller
+      - name: Build executables
+        run: python packaging/build.py
+      - name: Smoke test (lock -> verify -> unlock round trip)
+        env:
+          CRUNCHLOCK_PASSWORD: ci-smoke-test-passphrase
+        run: |
+          mkdir -p smoke/in
+          seq 1 100000 > smoke/in/numbers.txt
+          cp README.md smoke/in/
+          ./dist/crunchlock$EXE genpass
+          ./dist/crunchlock$EXE lock smoke/in -o smoke/t.clk -c best --recovery --pad --split 64K -q
+          ./dist/crunchlock$EXE verify smoke/t.clk.001 -q
+          ./dist/crunchlock$EXE unlock smoke/t.clk.001 -o smoke/out -q
+          diff -r smoke/in smoke/out/in
+          echo "round trip OK"
+      - name: Package
+        run: |
+          name=crunchlock-${{ runner.os }}-${{ runner.arch }}
+          mkdir -p package
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "../package/$name.zip" crunchlock.exe CrunchlockGUI.exe
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            tar czf "../package/$name.tar.gz" crunchlock CrunchlockGUI.app
+          else
+            tar czf "../package/$name.tar.gz" crunchlock CrunchlockGUI
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crunchlock-${{ runner.os }}
+          path: package/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

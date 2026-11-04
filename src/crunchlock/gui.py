@@ -596,6 +596,10 @@ class App:
 
 
 def main(argv=None) -> int:
+    # In a windowed executable (no console) stdout/stderr may be None.
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w"))
     if tk is None:
         print("crunchlock-gui needs Tkinter (e.g. `sudo apt install python3-tk`).", file=sys.stderr)
         return 1

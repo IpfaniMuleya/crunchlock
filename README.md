@@ -28,7 +28,32 @@ key), and restores them byte-for-byte.
 | Survive disk damage | `--recovery` (Reed-Solomon, +14%, repairs bursts up to 4 KB per 64 KB) |
 | Remove the originals | `--shred` (only after the new file is verified) |
 
-## Install
+## Download (no Python needed)
+
+Ready-to-run programs for **Windows (.exe)**, macOS and Linux are built automatically by
+GitHub Actions:
+
+- **Releases:** for each `v*` tag, the files are attached to the
+  [Releases page](../../releases).
+- **Latest build:** open the **Actions** tab, choose the newest *Test & build executables*
+  run, and download `crunchlock-Windows` (or `-macOS` / `-Linux`) under *Artifacts*.
+
+Each download contains:
+- `CrunchlockGUI.exe`: the desktop app. Double-click to run.
+- `crunchlock.exe`: the command-line tool.
+
+The programs aren't code-signed. Windows SmartScreen may show "Windows protected your PC";
+click *More info → Run anyway*. On macOS, right-click the app and choose *Open* the first
+time.
+
+To build them yourself, run this on the target OS:
+
+```bash
+pip install . pyinstaller
+python packaging/build.py      # -> dist/
+```
+
+## Install from source
 
 ```bash
 pip install .            # Python 3.10+
