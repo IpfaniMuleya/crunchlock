@@ -10,9 +10,10 @@ PW = "correct horse battery staple"
 
 
 def test_genpass():
-    p = passgen.generate(6)
-    words = p.split("-")
+    p = passgen.generate(6, separator=" ")  # a few EFF words contain "-" (e.g. felt-tip)
+    words = p.split(" ")
     assert len(words) == 6 and all(w in passgen.wordlist() for w in words)
+    assert passgen.generate(6).count("-") >= 5
     assert passgen.passphrase_bits(6) == pytest.approx(6 * math.log2(7776))
     assert len({passgen.generate(6) for _ in range(50)}) == 50
 
@@ -22,6 +23,17 @@ def test_genpass():
                                          ("Summer2024!", "weak"), ("x8#Kq!v2Lm&9pZ", "very strong")])
 def test_strength(pw, expected):
     assert passgen.rating(passgen.estimate_bits(pw)) == expected
+
+
+def test_hyphenated_words_are_handled():
+    """Regression: words like "felt-tip" must not be counted as two words."""
+    hyphenated = [w for w in passgen.wordlist() if "-" in w]
+    assert hyphenated  # drop-down, felt-tip, t-shirt, yo-yo
+    import random
+    rng = random.Random(1)
+    for _ in range(200):
+        words = [rng.choice(passgen.wordlist()) for _ in range(5)] + [rng.choice(hyphenated)]
+        assert len(" ".join(words).split(" ")) == 6
 
 
 def test_strength_of_generated():
@@ -50,8 +62,8 @@ def test_cli_end_to_end(tmp_path, sample, monkeypatch, capsys):
     monkeypatch.setenv(cli.ENV_PASSWORD, "wrong")
     assert cli.main(["verify", str(out), "-q"]) == 2
     capsys.readouterr()
-    assert cli.main(["genpass", "-w", "7"]) == 0
-    assert len(capsys.readouterr().out.strip().split("-")) == 7
+    assert cli.main(["genpass", "-w", "7", "-s", " "]) == 0
+    assert len(capsys.readouterr().out.strip().split(" ")) == 7
 
 
 def test_cli_recipients(tmp_path, sample, monkeypatch, capsys):
