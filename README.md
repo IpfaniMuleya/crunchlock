@@ -38,6 +38,9 @@ key), and restores them byte-for-byte.
 | Prove a file is from you | `lock --sign alice.clkkey`; the recipient runs `unlock --signer alice.clkpub` |
 | Add files to a locked file | `crunchlock add file.clk new.pdf more/` (no unpacking to disk) |
 | New version? | `crunchlock check-update`, or the opt-in check in the app |
+| Name people's keys | `crunchlock contacts add Alice alice.clkpub`, then `-r Alice` / `--signer Alice` |
+| Identical files stored once | automatic; restored as normal, separate copies |
+| Check a download | `crunchlock verify-file SHA256SUMS --signer release.clkpub` (see below) |
 | See what's inside / take out one file | `crunchlock list file.clk`, then `unlock file.clk --only docs/report.pdf` |
 | Lock files one by one | `crunchlock lock *.pdf --each -o locked/` → one `.clk` per item |
 | Fix a damaged file | `crunchlock repair file.clk` → `file.repaired.clk` (needs `--recovery`; no password needed) |
@@ -68,6 +71,27 @@ You can uninstall it from *Settings → Apps*. If you'd rather not install anyth
 The programs aren't code-signed. Windows SmartScreen may show "Windows protected your PC";
 click *More info → Run anyway*. On macOS, right-click the app and choose *Open* the first
 time.
+
+### Checking a download
+
+Each release includes `SHA256SUMS` (the SHA-256 of every Windows and Linux file), and
+`SHA256SUMS.clksig` when the release is signed. To check a download:
+
+```bash
+crunchlock verify-file SHA256SUMS --signer crunchlock-release.clkpub
+sha256sum -c SHA256SUMS --ignore-missing     # Windows: certutil -hashfile <file> SHA256
+```
+
+**For the maintainer: setting up release signing (once).**
+1. Run `crunchlock keygen crunchlock-release` and keep `crunchlock-release.clkkey` and its
+   passphrase safe and offline.
+2. Under *Settings → Secrets and variables → Actions*, add `RELEASE_SIGNING_KEY` with the
+   base64 of the private key (`base64 -w0 crunchlock-release.clkkey`, or on Windows
+   `certutil -encode` and remove the header lines), and `RELEASE_KEY_PASSPHRASE` with its
+   passphrase.
+3. Commit `crunchlock-release.clkpub` to the repository so people can check against it.
+
+Without the secrets, `SHA256SUMS` is still attached, but unsigned.
 
 ## Run it on your computer (from the source code)
 
@@ -236,6 +260,9 @@ files ─ tar ─▶ zstd/xz (optional) ─▶ AES-256-GCM in 1 MiB chunks ─�
   checked on unlock. It needs the standard zlib library: Python builds that use a different
   deflate (for example zlib-ng) switch the feature off, and every official download is checked
   for this. PNGs made by other encoders are stored unchanged.
+- **Identical files** inside one locked folder are stored once: later copies become link
+  entries. Each copy is checked again while it's stored, and unlocking restores it as a normal,
+  independent file. This helps most with photos and videos, which zstd can't shrink.
 - **Adding files** (`add`) decrypts the old file and streams it, plus the new items, straight
   into a new file with a new key. Nothing is unpacked to disk, and the original is replaced
   only after it has been fully authenticated. Public keys can't be read back from a file, so if
@@ -264,6 +291,8 @@ files ─ tar ─▶ zstd/xz (optional) ─▶ AES-256-GCM in 1 MiB chunks ─�
          original size in CRUNCHLOCK.size)
          0x02 = may contain PNGs stored unpacked (CRUNCHLOCK.png=1, .size, .crc)
          0x04 = signed: the last chunk ends with Ed25519 public key 32B ‖ signature 64B
+         0x08 = identical files may be stored once (tar hard link + CRUNCHLOCK.dup=1,
+                original marked CRUNCHLOCK.dupsrc=1); restored as separate copies
          Unknown flags are refused, so older versions never mis-extract newer files.
   password slot: 1 | t u32 | mem_kib u32 | par u8 | keyfile u8 | salt 16B | nonce 12B | wrapped_key 48B
   X25519 slot:   2 | ephemeral_pub 32B | nonce 12B | wrapped_key 48B

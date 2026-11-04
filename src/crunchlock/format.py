@@ -34,7 +34,8 @@ MAX_CHUNK = 64 * 1024 * 1024
 FLAG_JPEG_XL = 0x01  # archive may contain JPEGs losslessly recompressed as JPEG XL
 FLAG_PNG = 0x02      # archive may contain PNGs stored with their pixel data unpacked
 FLAG_SIGNED = 0x04   # the last chunk is an Ed25519 signature of the plaintext stream
-KNOWN_FLAGS = FLAG_JPEG_XL | FLAG_PNG | FLAG_SIGNED
+FLAG_DEDUP = 0x08    # archive may store identical files once (link entries, restored as copies)
+KNOWN_FLAGS = FLAG_JPEG_XL | FLAG_PNG | FLAG_SIGNED | FLAG_DEDUP
 
 SLOT_PASSWORD = 1
 SLOT_X25519 = 2
