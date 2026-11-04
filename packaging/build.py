@@ -19,6 +19,7 @@ COMMON = [
     "--noconfirm", "--clean", "--onefile",
     "--paths", str(ROOT / "src"),
     "--collect-data", "crunchlock",   # bundles the passphrase wordlist
+    "--collect-data", "sv_ttk",       # the Windows 11 style theme
     "--distpath", str(ROOT / "dist"),
     "--workpath", str(ROOT / "build"),
     "--specpath", str(ROOT / "build"),
